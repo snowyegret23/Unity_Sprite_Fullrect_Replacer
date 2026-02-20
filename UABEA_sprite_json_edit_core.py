@@ -284,7 +284,22 @@ def _is_fullrect_already(data: dict[str, Any], *, require_rect_expand: bool = Tr
     return True
 
 
-def patch_sprite_json(data: dict[str, Any], *, expand_to_m_rect: bool = True, lang: Language = "ko") -> tuple[int, int, bool, bool, bool]:
+def _is_unityex_compat_already(data: dict[str, Any]) -> bool:
+    rd = data.get("m_RD")
+    if not isinstance(rd, dict):
+        return False
+    if data.get("m_IsPolygon") is True:
+        return False
+    return _is_quad_mesh(rd)
+
+
+def patch_sprite_json(
+    data: dict[str, Any],
+    *,
+    patch_settings_raw: bool = True,
+    expand_to_m_rect: bool = True,
+    lang: Language = "ko",
+) -> tuple[int, int, bool, bool, bool]:
     if "m_RD" not in data or not isinstance(data["m_RD"], dict):
         raise ValueError(t(lang, "err_not_sprite_mrd"))
 
@@ -297,8 +312,11 @@ def patch_sprite_json(data: dict[str, Any], *, expand_to_m_rect: bool = True, la
     except Exception as exc:
         raise ValueError(t(lang, "err_raw_cast", value=rd["settingsRaw"])) from exc
 
-    after_raw = to_fullrect_settings_raw(before_raw)
-    rd["settingsRaw"] = after_raw
+    if patch_settings_raw:
+        after_raw = to_fullrect_settings_raw(before_raw)
+        rd["settingsRaw"] = after_raw
+    else:
+        after_raw = before_raw
 
     changed_polygon = False
     if "m_IsPolygon" in data and data["m_IsPolygon"] is not False:
@@ -332,16 +350,26 @@ def build_fullrect_output_path(path: Path) -> Path:
     return path.with_name(f"{path.stem}.fullrect{path.suffix}")
 
 
-def patch_payload(payload: Any, *, expand_to_m_rect: bool = True, lang: Language = "ko") -> tuple[str, dict[str, Any] | None]:
+def patch_payload(
+    payload: Any,
+    *,
+    patch_settings_raw: bool = True,
+    expand_to_m_rect: bool = True,
+    lang: Language = "ko",
+) -> tuple[str, dict[str, Any] | None]:
     if not isinstance(payload, dict):
         return "skip_non_object", None
     if "m_RD" not in payload or not isinstance(payload["m_RD"], dict) or "settingsRaw" not in payload["m_RD"]:
         return "skip_non_sprite", None
-    if _is_fullrect_already(payload, require_rect_expand=expand_to_m_rect):
+
+    if patch_settings_raw and _is_fullrect_already(payload, require_rect_expand=expand_to_m_rect):
+        return "already_fullrect", payload
+    if (not patch_settings_raw) and _is_unityex_compat_already(payload):
         return "already_fullrect", payload
 
     before_raw, after_raw, changed_polygon, expanded_rect, changed_mesh = patch_sprite_json(
         payload,
+        patch_settings_raw=patch_settings_raw,
         expand_to_m_rect=expand_to_m_rect,
         lang=lang,
     )
@@ -356,21 +384,34 @@ def patch_payload(payload: Any, *, expand_to_m_rect: bool = True, lang: Language
 
 
 def format_modified_message(details: dict[str, Any], lang: Language) -> str:
-    parts = [t(lang, "modified_base", before=details["before_raw"], after=details["after_raw"])]
+    parts: list[str] = []
+    if details.get("before_raw") != details.get("after_raw"):
+        parts.append(t(lang, "modified_base", before=details["before_raw"], after=details["after_raw"]))
     if details.get("changed_polygon"):
         parts.append(t(lang, "modified_polygon"))
     if details.get("expanded_rect"):
         parts.append(t(lang, "modified_rect"))
     if details.get("changed_mesh"):
         parts.append(t(lang, "modified_mesh"))
-    return ", ".join(parts)
+    return ", ".join(parts) if parts else t(lang, "modified_base", before=details["before_raw"], after=details["after_raw"])
 
 
-def patch_file_inplace(path: Path, *, expand_to_m_rect: bool = True, lang: Language = "ko") -> tuple[str, str]:
+def patch_file_inplace(
+    path: Path,
+    *,
+    patch_settings_raw: bool = True,
+    expand_to_m_rect: bool = True,
+    lang: Language = "ko",
+) -> tuple[str, str]:
     with path.open("r", encoding="utf-8-sig") as f:
         payload = json.load(f)
 
-    status, details = patch_payload(payload, expand_to_m_rect=expand_to_m_rect, lang=lang)
+    status, details = patch_payload(
+        payload,
+        patch_settings_raw=patch_settings_raw,
+        expand_to_m_rect=expand_to_m_rect,
+        lang=lang,
+    )
     if status != "modified":
         return status, ""
 
@@ -380,11 +421,22 @@ def patch_file_inplace(path: Path, *, expand_to_m_rect: bool = True, lang: Langu
     return status, format_modified_message(details, lang)
 
 
-def convert_file_to_copy(path: Path, *, expand_to_m_rect: bool = True, lang: Language = "ko") -> tuple[str, str, Path | None]:
+def convert_file_to_copy(
+    path: Path,
+    *,
+    patch_settings_raw: bool = True,
+    expand_to_m_rect: bool = True,
+    lang: Language = "ko",
+) -> tuple[str, str, Path | None]:
     with path.open("r", encoding="utf-8-sig") as f:
         payload = json.load(f)
 
-    status, details = patch_payload(payload, expand_to_m_rect=expand_to_m_rect, lang=lang)
+    status, details = patch_payload(
+        payload,
+        patch_settings_raw=patch_settings_raw,
+        expand_to_m_rect=expand_to_m_rect,
+        lang=lang,
+    )
     if status in {"skip_non_object", "skip_non_sprite"}:
         return status, "", None
 
@@ -433,6 +485,9 @@ def main_cli(lang: Language = "ko") -> None:
         print(t(lang, "done_no_targets"))
         return
 
+    patch_settings_raw = True
+    expand_to_m_rect = not args.no_expand_rect
+
     modified = 0
     generated = 0
     skipped_full = 0
@@ -449,7 +504,8 @@ def main_cli(lang: Language = "ko") -> None:
             try:
                 status, msg, output_path = convert_file_to_copy(
                     target,
-                    expand_to_m_rect=not args.no_expand_rect,
+                    patch_settings_raw=patch_settings_raw,
+                    expand_to_m_rect=expand_to_m_rect,
                     lang=lang,
                 )
             except Exception as e:
@@ -475,7 +531,8 @@ def main_cli(lang: Language = "ko") -> None:
             try:
                 status, msg = patch_file_inplace(
                     target,
-                    expand_to_m_rect=not args.no_expand_rect,
+                    patch_settings_raw=patch_settings_raw,
+                    expand_to_m_rect=expand_to_m_rect,
                     lang=lang,
                 )
             except Exception as e:
