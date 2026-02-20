@@ -623,22 +623,42 @@ def replace_sprites_in_assets_file(
         rect_now_w = int(round(float(rect_now.get("width", w))))
         rect_now_h = int(round(float(rect_now.get("height", h)))
         )
+        m_rect_now = cast(dict[str, Any], tree_now.get("m_Rect", {}))
+        full_x = int(round(float(m_rect_now.get("x", base_x))))
+        full_y = int(round(float(m_rect_now.get("y", base_y))))
+        full_w = int(round(float(m_rect_now.get("width", base_w))))
+        full_h = int(round(float(m_rect_now.get("height", base_h))))
+        if full_w <= 0 or full_h <= 0:
+            full_x, full_y, full_w, full_h = base_x, base_y, base_w, base_h
+        full_y_top = texture_image.height - (full_y + full_h)
+        if full_x < 0 or full_y_top < 0 or (full_x + full_w) > texture_image.width or (full_y_top + full_h) > texture_image.height:
+            full_x, full_y, full_w, full_h = base_x, base_y, base_w, base_h
+            full_y_top = base_y_top
 
         if target_mode == "fullrect":
-            target_img = replacement if replacement.size == (base_w, base_h) else replacement.resize((base_w, base_h), Image.Resampling.LANCZOS)
+            # fullrect는 m_Rect 기준으로 metadata를 맞추고, 실제 픽셀 기록은 입력 이미지 크기에 따라 안전하게 처리합니다.
+            # - 입력이 m_Rect와 동일하면 m_Rect 전체를 덮어씁니다.
+            # - 입력이 기존 textureRect와 동일하면 기존 영역만 덮어씁니다(왜곡 방지).
+            if replacement.size == (full_w, full_h):
+                write_x, write_y_top, write_w, write_h = full_x, full_y_top, full_w, full_h
+                target_img = replacement
+            else:
+                write_x, write_y_top, write_w, write_h = base_x, base_y_top, base_w, base_h
+                target_img = replacement if replacement.size == (base_w, base_h) else replacement.resize((base_w, base_h), Image.Resampling.LANCZOS)
+
             if changed_only:
-                current_crop = texture_image.crop((base_x, base_y_top, base_x + base_w, base_y_top + base_h))
+                current_crop = texture_image.crop((write_x, write_y_top, write_x + write_w, write_y_top + write_h))
                 expected_raw = convert_settings_raw(raw_now, "fullrect")
-                rect_ok = (rect_now_x, rect_now_y, rect_now_w, rect_now_h) == (base_x, base_y, base_w, base_h)
+                rect_ok = (rect_now_x, rect_now_y, rect_now_w, rect_now_h) == (full_x, full_y, full_w, full_h)
                 if image_equal(current_crop, target_img) and raw_now == expected_raw and rect_ok:
                     skipped_same += 1
                     continue
 
             # alpha 마스크 없이 덮어써야 sprite 결과가 원본 PNG와 일치합니다.
-            texture_image.paste(target_img, (base_x, base_y_top))
+            texture_image.paste(target_img, (write_x, write_y_top))
             texture.set_image(texture_image)
             texture.save()
-            before, after = apply_sprite_mode_and_rect(obj, mode="fullrect", tight_rect=(base_x, base_y, base_w, base_h))
+            before, after = apply_sprite_mode_and_rect(obj, mode="fullrect", tight_rect=(full_x, full_y, full_w, full_h))
             update_atlas_settings(sprite, mode="fullrect")
         else:
             fitted = replacement if replacement.size == (base_w, base_h) else replacement.resize((base_w, base_h), Image.Resampling.LANCZOS)
