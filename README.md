@@ -215,3 +215,7 @@ UABEA_sprite_json_edit.exe --dir "C:\path\to\json_folder" --recursive
 
 - `Managed` 폴더는 Sprite 수정 작업에 필요하지 않습니다.
 - 입력 경로는 게임 루트 / `_Data` / 단일 `.assets` 파일 모두 지원합니다.
+
+## 라이선스
+
+[MIT License](LICENSE)

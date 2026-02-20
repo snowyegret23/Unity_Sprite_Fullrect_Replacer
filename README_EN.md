@@ -215,3 +215,7 @@ UABEA_sprite_json_edit_en.exe --dir "C:\path\to\json_folder" --recursive
 
 - `Managed` folder is not required for Sprite-only modifications.
 - Input path supports game root / `_Data` / single `.assets` file.
+
+## License
+
+[MIT License](LICENSE)
