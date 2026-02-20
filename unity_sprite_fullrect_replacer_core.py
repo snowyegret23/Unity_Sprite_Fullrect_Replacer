@@ -154,6 +154,45 @@ def normalize_name_filter_token(raw: str) -> str:
     return token
 
 
+def replacement_token_from_filename(file_name: str) -> str:
+    token = file_name.strip()
+    lower = token.lower()
+    if lower.endswith(".sprite.png"):
+        token = token[: -len(".sprite.png")]
+    elif lower.endswith(".png"):
+        token = token[: -len(".png")]
+    else:
+        token = Path(token).stem
+    return token.strip()
+
+
+def build_filename_replacements(
+    replace_dir: Path,
+    *,
+    recursive: bool,
+    default_mode: Mode,
+) -> dict[str, JsonDict]:
+    pattern = "**/*.png" if recursive else "*.png"
+    replacements: dict[str, JsonDict] = {}
+    for png_path in sorted(replace_dir.glob(pattern)):
+        if not png_path.is_file():
+            continue
+        token = replacement_token_from_filename(png_path.name)
+        if not token:
+            continue
+        key = token.casefold()
+        normalized: JsonDict = {
+            "replace_path": str(png_path.resolve()),
+            "mode": default_mode,
+            "name": token,
+        }
+        if key in replacements:
+            print(f"[경고] 파일명 중복 매칭으로 이후 파일을 무시합니다: {png_path.name}")
+            continue
+        replacements[key] = normalized
+    return replacements
+
+
 def parse_id_filters(raw_values: list[str] | None) -> list[tuple[str, int]]:
     results: list[tuple[str, int]] = []
     for token in split_csv_args(raw_values):
@@ -613,7 +652,8 @@ def build_replacement_lookup(
 
         replace_path = Path(replace_raw)
         if not replace_path.is_absolute():
-            replace_path = (json_base_dir / replace_path).resolve()
+            # 상대경로는 JSON 위치가 아닌 exe(또는 스크립트) 위치 기준으로 해석합니다.
+            replace_path = (get_script_dir() / replace_path).resolve()
 
         mode = normalize_mode(value.get("Mode"), default=default_mode)
         normalized: JsonDict = {
@@ -656,6 +696,7 @@ def replace_sprites_in_assets_file(
     *,
     by_path_id: dict[tuple[str, str, int], JsonDict],
     by_name: dict[tuple[str, str, str], JsonDict],
+    by_filename: dict[str, JsonDict] | None,
     default_mode: Mode,
     skip_missing: bool,
     changed_only: bool,
@@ -680,6 +721,11 @@ def replace_sprites_in_assets_file(
         entry = by_path_id.get((file_lower, assets_name, path_id))
         if entry is None:
             entry = by_name.get((file_lower, assets_name, sprite_name))
+        if entry is None and by_filename is not None:
+            for token in (sprite_name.casefold(), sanitize_filename(sprite_name).casefold()):
+                entry = by_filename.get(token)
+                if entry is not None:
+                    break
         if entry is None:
             continue
 
@@ -865,6 +911,48 @@ def replace_from_json(
             assets_file,
             by_path_id=by_path_id,
             by_name=by_name,
+            by_filename=None,
+            default_mode=default_mode,
+            skip_missing=skip_missing,
+            changed_only=changed_only,
+        )
+        total_replaced += replaced
+        total_missing += missing
+        total_same += same
+
+    return total_replaced, total_missing, total_same
+
+
+def replace_from_dir(
+    assets_files: list[Path],
+    *,
+    replace_dir: Path,
+    recursive: bool,
+    default_mode: Mode,
+    skip_missing: bool,
+    changed_only: bool,
+) -> tuple[int, int, int]:
+    if not replace_dir.exists() or not replace_dir.is_dir():
+        raise FileNotFoundError(f"교체 폴더를 찾을 수 없습니다: {replace_dir}")
+
+    by_filename = build_filename_replacements(
+        replace_dir,
+        recursive=recursive,
+        default_mode=default_mode,
+    )
+    if not by_filename:
+        raise FileNotFoundError(f"교체할 PNG 파일을 찾을 수 없습니다: {replace_dir}")
+
+    total_replaced = 0
+    total_missing = 0
+    total_same = 0
+
+    for assets_file in assets_files:
+        replaced, missing, same = replace_sprites_in_assets_file(
+            assets_file,
+            by_path_id={},
+            by_name={},
+            by_filename=by_filename,
             default_mode=default_mode,
             skip_missing=skip_missing,
             changed_only=changed_only,
@@ -895,22 +983,23 @@ def main_cli(lang: Language = "ko") -> None:
   %(prog)s --gamepath "D:\\Games\\SomeGame_Data\\sharedassets0.assets" --extract-all --ids "sharedassets0.assets:186"
   %(prog)s --gamepath "D:\\Games\\SomeGame" --list sprites.json --mode fullrect
   %(prog)s --gamepath "D:\\Games\\SomeGame" --list sprites.json --mode tightclip
+  %(prog)s --gamepath "D:\\Games\\SomeGame" --replace-dir ".\\sprites" --mode fullrect
         """,
     )
     parser.add_argument("--gamepath", type=str, help="게임 루트 / _Data / 단일 .assets 파일 경로")
     parser.add_argument("--parse", action="store_true", help="Sprite 메타 정보를 JSON으로 추출")
     parser.add_argument("--extract-all", action="store_true", help="Sprite PNG 전체(또는 필터 대상) 추출")
     parser.add_argument("--list", type=str, metavar="JSON_FILE", help="JSON 기반 Sprite 교체")
-    parser.add_argument("--ids", action="append", help="파일명:PathID 필터. 콤마로 여러 개 지정 가능")
+    parser.add_argument("--replace-dir", type=str, metavar="DIR", help="JSON 없이 파일명 기반 Sprite 교체 PNG 폴더")
+    parser.add_argument("--replace-recursive", action="store_true", help="--replace-dir에서 하위 폴더까지 PNG 탐색")
+    parser.add_argument("--ids", "--id", dest="ids", action="append", help="파일명:PathID 필터. 콤마로 여러 개 지정 가능")
     parser.add_argument("--name", "--names", dest="name", action="append", help="Sprite 이름 필터. 콤마로 여러 개 지정 가능")
     parser.add_argument("--name-contains", action="append", help="Sprite 이름 부분일치 필터. 콤마로 여러 개 지정 가능")
     parser.add_argument("--mode", choices=["fullrect", "tightclip"], default="fullrect", help="교체 모드 기본값")
     parser.add_argument("--output-dir", type=str, help="추출 PNG 출력 폴더")
     parser.add_argument("--json-out", type=str, help="JSON 출력 파일 경로")
-    parser.add_argument("--skip-missing", dest="skip_missing", action="store_true", default=True, help="없는 Replace_to 파일은 스킵")
-    parser.add_argument("--no-skip-missing", dest="skip_missing", action="store_false", help="없는 Replace_to 파일 발견 시 오류")
-    parser.add_argument("--changed-only", dest="changed_only", action="store_true", default=True, help="변경분만 반영")
-    parser.add_argument("--no-changed-only", dest="changed_only", action="store_false", help="동일 이미지도 강제 재기록")
+    parser.add_argument("--skip-missing", default=True, action=argparse.BooleanOptionalAction, help="없는 Replace_to 파일은 스킵 (기본: 켜짐)")
+    parser.add_argument("--changed-only", default=True, action=argparse.BooleanOptionalAction, help="변경분만 반영 (기본: 켜짐)")
     parser.add_argument("--verbose", action="store_true", help="로그를 verbose.txt로 저장")
     args = parser.parse_args()
 
@@ -951,22 +1040,32 @@ def main_cli(lang: Language = "ko") -> None:
 
     mode_parse = args.parse
     mode_extract = args.extract_all
-    mode_replace = bool(args.list)
-    if not mode_parse and not mode_extract and not mode_replace:
+    mode_replace_json = bool(args.list)
+    mode_replace_dir = bool(args.replace_dir)
+    if mode_replace_json and mode_replace_dir:
+        exit_with_error("--list 와 --replace-dir 는 동시에 사용할 수 없습니다.")
+
+    if not mode_parse and not mode_extract and not mode_replace_json and not mode_replace_dir:
         print("작업을 선택하세요:")
         print("  1. Sprite 정보 추출 (JSON)")
         print("  2. JSON 기반 Sprite 교체")
         print("  3. Sprite 추출 (PNG + JSON)")
-        choice = ask_choice("선택 (1-3): ", {"1", "2", "3"})
+        print("  4. 파일명 기반 Sprite 교체 (JSON 없이)")
+        choice = ask_choice("선택 (1-4): ", {"1", "2", "3", "4"})
         if choice == "1":
             mode_parse = True
         elif choice == "2":
-            mode_replace = True
+            mode_replace_json = True
             args.list = input("JSON 파일 경로를 입력하세요: ").strip()
             if not args.list:
                 exit_with_error("JSON 파일 경로가 필요합니다.")
-        else:
+        elif choice == "3":
             mode_extract = True
+        else:
+            mode_replace_dir = True
+            args.replace_dir = input("교체 PNG 폴더 경로를 입력하세요: ").strip()
+            if not args.replace_dir:
+                exit_with_error("교체 폴더 경로가 필요합니다.")
 
     script_dir = get_script_dir()
     game_tag = sanitize_filename(game_path.name if game_path.name else "unity_game")
@@ -999,7 +1098,7 @@ def main_cli(lang: Language = "ko") -> None:
         )
         print(f"[완료] 추출된 Sprite 수: {count}")
 
-    if mode_replace:
+    if mode_replace_json:
         if not args.list:
             exit_with_error("--list JSON_FILE 이 필요합니다.")
         json_path = Path(args.list).expanduser().resolve()
@@ -1008,6 +1107,20 @@ def main_cli(lang: Language = "ko") -> None:
         replaced, missing, same = replace_from_json(
             assets_files,
             json_path=json_path,
+            default_mode=default_mode,
+            skip_missing=args.skip_missing,
+            changed_only=args.changed_only,
+        )
+        print(f"[완료] 교체 수: {replaced}, 누락 스킵: {missing}, 동일 이미지 스킵: {same}")
+
+    if mode_replace_dir:
+        if not args.replace_dir:
+            exit_with_error("--replace-dir DIR 이 필요합니다.")
+        replace_dir = Path(args.replace_dir).expanduser().resolve()
+        replaced, missing, same = replace_from_dir(
+            assets_files,
+            replace_dir=replace_dir,
+            recursive=args.replace_recursive,
             default_mode=default_mode,
             skip_missing=args.skip_missing,
             changed_only=args.changed_only,

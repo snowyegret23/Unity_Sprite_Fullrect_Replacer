@@ -8,11 +8,11 @@ Unity Sprite 추출/교체 도구입니다.
 ## 주요 기능
 
 1. Sprite 정보 추출(JSON)
-2. JSON 기반 Sprite 교체
+2. Sprite 교체 (JSON 기반 / 파일명 기반)
 3. Sprite 전체 추출(PNG + JSON)
 4. Sprite 일괄 Import(변경분만 반영, 없는 파일은 기본 스킵)
 5. 필터 추출
-   - 파일명 + PathID 기반(`--ids`)
+   - 파일명 + PathID 기반(`--ids`, `--id`)
    - 이름 기반(`--names`, `--name-contains`)
 6. 교체 모드
    - `fullrect`: FullRect 강제
@@ -54,57 +54,63 @@ dist\UABEA_sprite_json_edit_en.exe
 unity_sprite_fullrect_replacer.exe [옵션]
 ```
 
-전체 옵션 목록(빠짐없이):
+옵션 목록(추출 / 삽입 / 공통):
+
+### 공통
 
 - `--gamepath PATH`
   - 게임 루트 / `_Data` / 단일 `.assets` 파일 경로
   - 기본값: 없음(미지정 시 실행 중 입력)
+- `--mode fullrect|tightclip`
+  - 교체 모드 기본값
+  - 기본값: `fullrect`
+- `--verbose`
+  - 콘솔 로그를 `verbose.txt`에도 저장
+  - 기본값: `False`
+
+### 추출
+
 - `--parse`
   - Sprite 메타 JSON 추출
   - 기본값: `False`
 - `--extract-all`
   - Sprite PNG 전체(또는 필터 대상) 추출 + JSON 생성(옵션)
   - 기본값: `False`
-- `--list JSON_FILE`
-  - JSON 기반 Sprite 교체
-  - 기본값: 없음
-- `--ids IDS`
+- `--ids IDS` / `--id IDS`
   - 파일명+PathID 필터, 콤마/반복 지정 가능
   - 예: `--ids "sharedassets0.assets:186,sharedassets0.assets:200"`
   - 기본값: 없음
-- `--name NAME`
+- `--name NAME` / `--names NAME`
   - Sprite 이름 필터 (반복/콤마 지정 가능)
-  - 기본값: 없음
-- `--names NAME`
-  - `--name`과 동일한 별칭
   - 기본값: 없음
 - `--name-contains TEXT`
   - Sprite 이름 부분일치 필터 (반복/콤마 지정 가능)
   - 기본값: 없음
-- `--mode fullrect|tightclip`
-  - 교체 모드
-  - 기본값: `fullrect`
 - `--output-dir PATH`
   - `--extract-all` PNG 출력 폴더
   - 기본값: `<스크립트폴더>\<게임이름>_sprites`
 - `--json-out PATH`
   - `--parse`/`--extract-all` JSON 출력 파일 경로
   - 기본값: `<스크립트폴더>\<게임이름>_sprites.json`
-- `--skip-missing`
-  - `Replace_to` 파일이 없어도 스킵하고 계속 진행
-  - 기본값: `True`
-- `--no-skip-missing`
-  - `Replace_to` 파일이 없으면 오류로 중단
+
+### 삽입
+
+- `--list JSON_FILE`
+  - JSON 기반 Sprite 교체
+  - 기본값: 없음
+- `--replace-dir DIR`
+  - JSON 없이 파일명 기준으로 Sprite 교체할 PNG 폴더
+  - 기본값: 없음
+- `--replace-recursive`
+  - `--replace-dir`에서 하위 폴더까지 PNG 탐색
   - 기본값: `False`
-- `--changed-only`
-  - 실제 변경분만 반영
-  - 기본값: `True`
-- `--no-changed-only`
-  - 동일 데이터여도 강제 재기록
-  - 기본값: `False`
-- `--verbose`
-  - 콘솔 로그를 `verbose.txt`에도 저장
-  - 기본값: `False`
+- `--skip-missing` / `--no-skip-missing`
+  - `Replace_to` 파일 누락 시 스킵 여부
+  - 기본값: `--skip-missing`(켜짐)
+- `--changed-only` / `--no-changed-only`
+  - 실제 변경분만 반영할지 여부
+  - 기본값: `--changed-only`(켜짐)
+- 주의: `--list`와 `--replace-dir`는 동시에 사용할 수 없습니다.
 
 실행 예시:
 
@@ -139,9 +145,15 @@ unity_sprite_fullrect_replacer.exe --gamepath "D:\Games\Game" --list ".\sprites.
 unity_sprite_fullrect_replacer.exe --gamepath "D:\Games\Game" --list ".\sprites.json" --mode tightclip
 ```
 
+7. 파일명 기반 교체 (JSON 없이)
+```bat
+unity_sprite_fullrect_replacer.exe --gamepath "D:\Games\Game" --replace-dir ".\sprites" --mode fullrect
+```
+
 ## JSON 형식
 
 `--parse` 또는 `--extract-all`로 생성한 JSON을 수정해서 `--list`에 넣으면 됩니다.
+`Replace_to`를 상대경로로 적으면 **exe(또는 스크립트) 위치 기준**으로 해석됩니다.
 
 ```json
 {
