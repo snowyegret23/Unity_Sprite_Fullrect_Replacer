@@ -215,6 +215,10 @@ UABEA_sprite_json_edit_en.exe --dir "C:\path\to\json_folder" --recursive
 
 - `Managed` folder is not required for Sprite-only modifications.
 - Input path supports game root / `_Data` / single `.assets` file.
+- In `fullrect` replacement, the tool updates `textureRect/textureRectOffset` to match `m_Rect` together with `settingsRaw`.
+- When `--gamepath` is a game root or `_Data` folder, the tool prioritizes top-level `.assets` files in `_Data`.
+  (Backup copies under subfolders such as `Original`/`backup` are excluded from default scan.)
+- If a Texture2D `.resS` resource is missing, that entry is skipped instead of aborting the entire run.
 
 ## License
 

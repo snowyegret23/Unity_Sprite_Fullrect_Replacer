@@ -71,6 +71,14 @@ def get_script_dir() -> Path:
 
 
 def find_assets_files(data_path: Path) -> list[Path]:
+    # 기본은 _Data 최상위의 표준 Unity assets 집합을 사용합니다.
+    # (예: Original/backup 폴더의 복사본까지 재귀로 잡히는 것을 방지)
+    top_level = [p for p in data_path.glob("*.assets") if p.is_file()]
+    top_level.sort()
+    if top_level:
+        return top_level
+
+    # 예외적으로 최상위에 없을 때만 재귀 탐색합니다.
     assets_files = [p for p in data_path.rglob("*.assets") if p.is_file()]
     assets_files.sort()
     return assets_files
@@ -595,7 +603,11 @@ def replace_sprites_in_assets_file(
             print(f"[스킵] Texture2D를 찾을 수 없습니다: {assets_file.name}:{path_id}:{sprite_name}")
             continue
 
-        texture_image = texture.image.convert("RGBA")
+        try:
+            texture_image = texture.image.convert("RGBA")
+        except FileNotFoundError as e:
+            print(f"[스킵] 리소스 파일 누락으로 Texture2D를 읽을 수 없습니다: {assets_file.name}:{path_id}:{sprite_name} ({e})")
+            continue
         texture_rect = getattr(getattr(sprite, "m_RD", None), "textureRect", None)
         x = int(round(getattr(texture_rect, "x", 0.0)))
         y = int(round(getattr(texture_rect, "y", 0.0)))
