@@ -169,6 +169,7 @@ unity_sprite_fullrect_replacer.exe --gamepath "D:\Games\Game" --list ".\sprites.
 - UABEA로 덤프한 Sprite JSON을 FullRect 기준으로 보정
 - `m_RD.settingsRaw`를 FullRect 비트로 변경
 - `m_RD.textureRect` / `textureRectOffset`를 `m_Rect` 기준으로 확장
+- `m_RD.m_VertexData` / `m_IndexBuffer` / `m_SubMeshes`를 FullRect용 쿼드 메쉬(4정점)로 보정
 
 동작 규칙:
 - **인자 있음**: `<원본이름>.fullrect.json` 파일 생성 (원본 유지)

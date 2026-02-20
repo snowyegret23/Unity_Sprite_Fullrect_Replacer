@@ -169,6 +169,7 @@ What it does:
 - Patch UABEA Sprite JSON for FullRect workflow
 - Update `m_RD.settingsRaw` to FullRect bits
 - Expand `m_RD.textureRect` / `textureRectOffset` based on `m_Rect`
+- Rebuild `m_RD.m_VertexData` / `m_IndexBuffer` / `m_SubMeshes` into a FullRect quad mesh (4 vertices)
 
 Behavior:
 - **With input arguments**: create `<original_name>.fullrect.json` (keep original file)

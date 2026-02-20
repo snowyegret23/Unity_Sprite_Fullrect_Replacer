@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import struct
 import sys
 import traceback as tb_module
 from pathlib import Path
@@ -46,6 +47,7 @@ def t(lang: Language, key: str, **kwargs: Any) -> str:
         "modified_base": "modified settingsRaw {before}->{after}",
         "modified_polygon": "m_IsPolygon=false",
         "modified_rect": "textureRect=m_Rect",
+        "modified_mesh": "quad mesh rebuilt",
         "unexpected": "\n예상치 못한 오류가 발생했습니다: {error}",
     }
 
@@ -83,6 +85,7 @@ def t(lang: Language, key: str, **kwargs: Any) -> str:
         "modified_base": "modified settingsRaw {before}->{after}",
         "modified_polygon": "m_IsPolygon=false",
         "modified_rect": "textureRect=m_Rect",
+        "modified_mesh": "quad mesh rebuilt",
         "unexpected": "\nAn unexpected error occurred: {error}",
     }
 
@@ -105,6 +108,130 @@ def _to_float(value: Any, default: float = 0.0) -> float:
 
 def _is_close(a: float, b: float, eps: float = 1e-4) -> bool:
     return abs(a - b) <= eps
+
+
+def _array_view(value: Any) -> list[Any] | None:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        arr = value.get("Array")
+        if isinstance(arr, list):
+            return arr
+    return None
+
+
+def _is_quad_mesh(rd: dict[str, Any]) -> bool:
+    vd = rd.get("m_VertexData")
+    if not isinstance(vd, dict):
+        return False
+    try:
+        vcount = int(vd.get("m_VertexCount", 0))
+    except Exception:
+        return False
+    if vcount != 4:
+        return False
+
+    idx = _array_view(rd.get("m_IndexBuffer"))
+    if idx is None or len(idx) != 12:
+        return False
+
+    sub = _array_view(rd.get("m_SubMeshes"))
+    if sub is None or not sub:
+        return False
+    first = sub[0]
+    if not isinstance(first, dict):
+        return False
+    return int(first.get("indexCount", 0)) == 6 and int(first.get("vertexCount", 0)) == 4
+
+
+def _force_quad_mesh(rd: dict[str, Any]) -> bool:
+    vd = rd.get("m_VertexData")
+    if not isinstance(vd, dict):
+        return False
+
+    try:
+        vcount = int(vd.get("m_VertexCount", 0))
+    except Exception:
+        return False
+    raw_data = vd.get("m_DataSize")
+    data = _array_view(raw_data)
+    if data is None or vcount < 3:
+        return False
+
+    data_bytes = bytes((int(x) & 0xFF) for x in data)
+    pos_size = vcount * 12
+    uv_size = vcount * 8
+    if len(data_bytes) < pos_size + uv_size:
+        return False
+
+    xs: list[float] = []
+    ys: list[float] = []
+    zs: list[float] = []
+    for i in range(vcount):
+        x, y, z = struct.unpack_from("<fff", data_bytes, i * 12)
+        xs.append(float(x))
+        ys.append(float(y))
+        zs.append(float(z))
+
+    min_x = min(xs)
+    max_x = max(xs)
+    min_y = min(ys)
+    max_y = max(ys)
+    z = sum(zs) / len(zs) if zs else 0.0
+
+    out = bytearray()
+    for px, py, pz in (
+        (min_x, min_y, z),
+        (min_x, max_y, z),
+        (max_x, max_y, z),
+        (max_x, min_y, z),
+    ):
+        out.extend(struct.pack("<fff", px, py, pz))
+    for _ in range(4):
+        out.extend(struct.pack("<ff", 0.0, 0.0))
+
+    vd["m_VertexCount"] = 4
+    vd["m_DataSize"] = list(out)
+    rd["m_VertexData"] = vd
+
+    quad_idx = [0, 0, 1, 0, 2, 0, 0, 0, 2, 0, 3, 0]
+    idx_obj = rd.get("m_IndexBuffer")
+    if isinstance(idx_obj, dict):
+        idx_obj["Array"] = quad_idx
+        rd["m_IndexBuffer"] = idx_obj
+    else:
+        rd["m_IndexBuffer"] = {"Array": quad_idx}
+
+    sub_obj = rd.get("m_SubMeshes")
+    sub_arr = _array_view(sub_obj)
+    if sub_arr is None or not sub_arr:
+        sub_arr = [{
+            "firstByte": 0,
+            "indexCount": 6,
+            "topology": 0,
+            "baseVertex": 0,
+            "firstVertex": 0,
+            "vertexCount": 4,
+            "localAABB": {
+                "m_Center": {"x": 0.0, "y": 0.0, "z": 0.0},
+                "m_Extent": {"x": 0.0, "y": 0.0, "z": 0.0},
+            },
+        }]
+    else:
+        first = sub_arr[0]
+        if isinstance(first, dict):
+            first["firstByte"] = 0
+            first["indexCount"] = 6
+            first["baseVertex"] = 0
+            first["firstVertex"] = 0
+            first["vertexCount"] = 4
+            sub_arr[0] = first
+    if isinstance(sub_obj, dict):
+        sub_obj["Array"] = sub_arr
+        rd["m_SubMeshes"] = sub_obj
+    else:
+        rd["m_SubMeshes"] = {"Array": sub_arr}
+    return True
 
 
 def _is_fullrect_already(data: dict[str, Any], *, require_rect_expand: bool = True) -> bool:
@@ -151,10 +278,13 @@ def _is_fullrect_already(data: dict[str, Any], *, require_rect_expand: bool = Tr
         if not (_is_close(x, ox) and _is_close(y, oy)):
             return False
 
+    if not _is_quad_mesh(rd):
+        return False
+
     return True
 
 
-def patch_sprite_json(data: dict[str, Any], *, expand_to_m_rect: bool = True, lang: Language = "ko") -> tuple[int, int, bool, bool]:
+def patch_sprite_json(data: dict[str, Any], *, expand_to_m_rect: bool = True, lang: Language = "ko") -> tuple[int, int, bool, bool, bool]:
     if "m_RD" not in data or not isinstance(data["m_RD"], dict):
         raise ValueError(t(lang, "err_not_sprite_mrd"))
 
@@ -194,7 +324,8 @@ def patch_sprite_json(data: dict[str, Any], *, expand_to_m_rect: bool = True, la
                 rd_rect_off["y"] = y
             expanded_rect = True
 
-    return before_raw, after_raw, changed_polygon, expanded_rect
+    changed_mesh = _force_quad_mesh(rd)
+    return before_raw, after_raw, changed_polygon, expanded_rect, changed_mesh
 
 
 def build_fullrect_output_path(path: Path) -> Path:
@@ -209,7 +340,7 @@ def patch_payload(payload: Any, *, expand_to_m_rect: bool = True, lang: Language
     if _is_fullrect_already(payload, require_rect_expand=expand_to_m_rect):
         return "already_fullrect", payload
 
-    before_raw, after_raw, changed_polygon, expanded_rect = patch_sprite_json(
+    before_raw, after_raw, changed_polygon, expanded_rect, changed_mesh = patch_sprite_json(
         payload,
         expand_to_m_rect=expand_to_m_rect,
         lang=lang,
@@ -220,6 +351,7 @@ def patch_payload(payload: Any, *, expand_to_m_rect: bool = True, lang: Language
         "after_raw": after_raw,
         "changed_polygon": changed_polygon,
         "expanded_rect": expanded_rect,
+        "changed_mesh": changed_mesh,
     }
 
 
@@ -229,6 +361,8 @@ def format_modified_message(details: dict[str, Any], lang: Language) -> str:
         parts.append(t(lang, "modified_polygon"))
     if details.get("expanded_rect"):
         parts.append(t(lang, "modified_rect"))
+    if details.get("changed_mesh"):
+        parts.append(t(lang, "modified_mesh"))
     return ", ".join(parts)
 
 
