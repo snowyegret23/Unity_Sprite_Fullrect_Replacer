@@ -5,6 +5,7 @@ import io
 import json
 import os
 import re
+import struct
 import sys
 import traceback as tb_module
 from pathlib import Path
@@ -409,6 +410,117 @@ def convert_settings_raw(raw: int, mode: Mode) -> int:
     return (raw & ~(1 << 1)) | (1 << 6)
 
 
+def _is_quad_mesh(rd: dict[str, Any]) -> bool:
+    vd = rd.get("m_VertexData")
+    if not isinstance(vd, dict):
+        return False
+    try:
+        vcount = int(vd.get("m_VertexCount", 0))
+    except Exception:
+        return False
+    if vcount != 4:
+        return False
+
+    idx = rd.get("m_IndexBuffer")
+    if not isinstance(idx, list) or len(idx) != 12:
+        return False
+
+    sub_meshes = rd.get("m_SubMeshes")
+    if not isinstance(sub_meshes, list) or not sub_meshes:
+        return False
+    first = sub_meshes[0]
+    if not isinstance(first, dict):
+        return False
+    return int(first.get("indexCount", 0)) == 6 and int(first.get("vertexCount", 0)) == 4
+
+
+def _force_quad_mesh_from_current_bounds(rd: dict[str, Any]) -> bool:
+    vd = rd.get("m_VertexData")
+    if not isinstance(vd, dict):
+        return False
+
+    try:
+        vcount = int(vd.get("m_VertexCount", 0))
+    except Exception:
+        return False
+    data = vd.get("m_DataSize")
+    if not isinstance(data, (bytes, bytearray)):
+        return False
+    if vcount < 3:
+        return False
+
+    # Sprite(Vertex) layout used by these assets:
+    # - stream0: float3 position array (vcount * 12 bytes)
+    # - stream1: float2 uv array       (vcount * 8 bytes)
+    pos_size = vcount * 12
+    uv_size = vcount * 8
+    if len(data) < pos_size + uv_size:
+        return False
+
+    xs: list[float] = []
+    ys: list[float] = []
+    zs: list[float] = []
+    for i in range(vcount):
+        x, y, z = struct.unpack_from("<fff", data, i * 12)
+        xs.append(float(x))
+        ys.append(float(y))
+        zs.append(float(z))
+
+    min_x = min(xs)
+    max_x = max(xs)
+    min_y = min(ys)
+    max_y = max(ys)
+    z = sum(zs) / len(zs) if zs else 0.0
+
+    # Build 4-vertex rectangle and keep uv all-zero (same style as UnityEX/manual output for this title).
+    positions = [
+        (min_x, min_y, z),
+        (min_x, max_y, z),
+        (max_x, max_y, z),
+        (max_x, min_y, z),
+    ]
+    uvs = [(0.0, 0.0)] * 4
+
+    out = bytearray()
+    for px, py, pz in positions:
+        out.extend(struct.pack("<fff", px, py, pz))
+    for u, v in uvs:
+        out.extend(struct.pack("<ff", u, v))
+
+    vd["m_VertexCount"] = 4
+    vd["m_DataSize"] = bytes(out)
+    rd["m_VertexData"] = vd
+
+    rd["m_IndexBuffer"] = [0, 0, 1, 0, 2, 0, 0, 0, 2, 0, 3, 0]
+
+    sub_meshes = rd.get("m_SubMeshes")
+    if not isinstance(sub_meshes, list) or not sub_meshes:
+        sub_meshes = [{
+            "firstByte": 0,
+            "indexCount": 6,
+            "topology": 0,
+            "baseVertex": 0,
+            "firstVertex": 0,
+            "vertexCount": 4,
+            "localAABB": {
+                "m_Center": {"x": 0.0, "y": 0.0, "z": 0.0},
+                "m_Extent": {"x": 0.0, "y": 0.0, "z": 0.0},
+            },
+        }]
+    else:
+        first = sub_meshes[0]
+        if isinstance(first, dict):
+            first["firstByte"] = 0
+            first["indexCount"] = 6
+            first["topology"] = int(first.get("topology", 0))
+            first["baseVertex"] = 0
+            first["firstVertex"] = 0
+            first["vertexCount"] = 4
+            sub_meshes[0] = first
+    rd["m_SubMeshes"] = sub_meshes
+    return True
+
+
 def apply_sprite_mode_and_rect(
     sprite_obj: Any,
     *,
@@ -439,6 +551,9 @@ def apply_sprite_mode_and_rect(
         texture_rect_offset["x"] = float(x)
         texture_rect_offset["y"] = float(y)
         rd["textureRectOffset"] = texture_rect_offset
+
+    if mode == "fullrect":
+        _force_quad_mesh_from_current_bounds(rd)
 
     tree["m_RD"] = rd
     sprite_obj.save_typetree(tree)
@@ -662,7 +777,8 @@ def replace_sprites_in_assets_file(
                 current_crop = texture_image.crop((write_x, write_y_top, write_x + write_w, write_y_top + write_h))
                 expected_raw = convert_settings_raw(raw_now, "fullrect")
                 rect_ok = (rect_now_x, rect_now_y, rect_now_w, rect_now_h) == (full_x, full_y, full_w, full_h)
-                if image_equal(current_crop, target_img) and raw_now == expected_raw and rect_ok:
+                mesh_ok = _is_quad_mesh(rd_now)
+                if image_equal(current_crop, target_img) and raw_now == expected_raw and rect_ok and mesh_ok:
                     skipped_same += 1
                     continue
 
