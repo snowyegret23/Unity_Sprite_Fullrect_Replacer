@@ -40,13 +40,17 @@ jobs:
         run: |
           mkdir release
           copy dist\unity_sprite_fullrect_replacer.exe release\
-          copy dist\unity_sprite_fullrect_replacer_en.exe release\
           copy dist\UABEA_sprite_json_edit.exe release\
-          copy dist\UABEA_sprite_json_edit_en.exe release\
+          copy README.md release\
+          mkdir release_en
+          copy dist\unity_sprite_fullrect_replacer_en.exe release_en\
+          copy dist\UABEA_sprite_json_edit_en.exe release_en\
+          copy README_EN.md release_en\
 
       - name: Create ZIP archive
         run: |
           Compress-Archive -Path release\* -DestinationPath Unity_Sprite_Fullrect_Replacer_v${{ inputs.version }}.zip
+          Compress-Archive -Path release_en\* -DestinationPath Unity_Sprite_Fullrect_Replacer_EN_v${{ inputs.version }}.zip
 
       - name: Create tag
         run: |
@@ -63,6 +67,7 @@ jobs:
           draft: true
           files: |
             Unity_Sprite_Fullrect_Replacer_v${{ inputs.version }}.zip
+            Unity_Sprite_Fullrect_Replacer_EN_v${{ inputs.version }}.zip
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
