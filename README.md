@@ -17,6 +17,7 @@ Unity Sprite 추출/교체 도구입니다.
 6. 교체 모드
    - `fullrect`: FullRect 강제
    - `tightclip`: 이미지 알파 영역 기준 bbox로 타이트 클리핑
+   - `tightmesh`: 이미지 알파 외곽선 기반 폴리곤 메쉬로 타이트 클리핑
 
 ## 실행 파일 준비
 
@@ -30,7 +31,7 @@ Unity Sprite 추출/교체 도구입니다.
 소스에서 직접 빌드하는 경우:
 
 ```bash
-py -3.12 -m pip install -U pyinstaller UnityPy Pillow
+py -3.12 -m pip install -U pyinstaller UnityPy Pillow opencv-python-headless mapbox-earcut numpy
 py -3.12 -m PyInstaller --onefile --name unity_sprite_fullrect_replacer unity_sprite_fullrect_replacer.py
 py -3.12 -m PyInstaller --onefile --name unity_sprite_fullrect_replacer_en unity_sprite_fullrect_replacer_en.py
 py -3.12 -m PyInstaller --onefile --name UABEA_sprite_json_edit UABEA_sprite_json_edit.py
@@ -61,7 +62,7 @@ unity_sprite_fullrect_replacer.exe [옵션]
 - `--gamepath PATH`
   - 게임 루트 / `_Data` / 단일 `.assets` 파일 경로
   - 기본값: 없음(미지정 시 실행 중 입력)
-- `--mode fullrect|tightclip`
+- `--mode fullrect|tightclip|tightmesh`
   - 교체 모드 기본값
   - 기본값: `fullrect`
 - `--verbose`
@@ -145,7 +146,12 @@ unity_sprite_fullrect_replacer.exe --gamepath "D:\Games\Game" --list ".\sprites.
 unity_sprite_fullrect_replacer.exe --gamepath "D:\Games\Game" --list ".\sprites.json" --mode tightclip
 ```
 
-7. 파일명 기반 교체 (JSON 없이)
+7. JSON 기반 교체 (tightmesh)
+```bat
+unity_sprite_fullrect_replacer.exe --gamepath "D:\Games\Game" --list ".\sprites.json" --mode tightmesh
+```
+
+8. 파일명 기반 교체 (JSON 없이)
 ```bat
 unity_sprite_fullrect_replacer.exe --gamepath "D:\Games\Game" --replace-dir ".\sprites" --mode fullrect
 ```
@@ -229,6 +235,8 @@ UABEA_sprite_json_edit.exe --dir "C:\path\to\json_folder" --recursive
 - `Managed` 폴더는 Sprite 수정 작업에 필요하지 않습니다.
 - 입력 경로는 게임 루트 / `_Data` / 단일 `.assets` 파일 모두 지원합니다.
 - `fullrect` 교체 시 `settingsRaw`와 함께 `textureRect/textureRectOffset`도 `m_Rect` 기준으로 맞춰 적용합니다.
+- `tightmesh`는 알파 외곽선으로 생성한 폴리곤 메쉬를 `m_VertexData/m_IndexBuffer/m_SubMeshes`에 반영합니다.
+  - `tightmesh` 품질 향상을 위해 `opencv-python-headless`, `mapbox-earcut`, `numpy`를 권장합니다.
 - `--gamepath`에 게임 루트 또는 `_Data`를 줄 때는 `_Data` 최상위 `.assets`를 우선 처리합니다.
   (하위 폴더의 `Original`/`backup` 복사본 `.assets`는 기본 스캔에서 제외됩니다.)
 - Texture2D 로드 중 `.resS`가 누락된 항목은 프로그램 전체 중단 대신 해당 항목만 스킵합니다.

@@ -14,10 +14,25 @@ from typing import Any, Literal, NoReturn, cast
 import UnityPy
 from PIL import Image, ImageChops
 
+try:
+    import cv2  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    cv2 = None  # type: ignore[assignment]
+
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    np = None  # type: ignore[assignment]
+
+try:
+    import mapbox_earcut as earcut  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    earcut = None  # type: ignore[assignment]
+
 
 Language = Literal["ko", "en"]
 JsonDict = dict[str, Any]
-Mode = Literal["fullrect", "tightclip"]
+Mode = Literal["fullrect", "tightclip", "tightmesh"]
 
 
 class TeeWriter:
@@ -141,6 +156,8 @@ def normalize_mode(raw: Any, default: Mode = "fullrect") -> Mode:
         return "fullrect"
     if token in {"tight", "tightclip", "tightbbox"}:
         return "tightclip"
+    if token in {"tightmesh", "tightpoly", "polygon"}:
+        return "tightmesh"
     return default
 
 
@@ -473,28 +490,49 @@ def _is_quad_mesh(rd: dict[str, Any]) -> bool:
     return int(first.get("indexCount", 0)) == 6 and int(first.get("vertexCount", 0)) == 4
 
 
-def _force_quad_mesh_from_current_bounds(rd: dict[str, Any]) -> bool:
+def _is_tight_mesh(rd: dict[str, Any]) -> bool:
     vd = rd.get("m_VertexData")
     if not isinstance(vd, dict):
         return False
-
     try:
         vcount = int(vd.get("m_VertexCount", 0))
     except Exception:
         return False
-    data = vd.get("m_DataSize")
-    if not isinstance(data, (bytes, bytearray)):
-        return False
     if vcount < 3:
         return False
 
-    # Sprite(Vertex) layout used by these assets:
-    # - stream0: float3 position array (vcount * 12 bytes)
-    # - stream1: float2 uv array       (vcount * 8 bytes)
+    idx = rd.get("m_IndexBuffer")
+    if not isinstance(idx, list) or len(idx) < 6 or (len(idx) % 6) != 0:
+        return False
+
+    sub_meshes = rd.get("m_SubMeshes")
+    if not isinstance(sub_meshes, list) or not sub_meshes:
+        return False
+    first = sub_meshes[0]
+    if not isinstance(first, dict):
+        return False
+    return int(first.get("indexCount", 0)) >= 3 and int(first.get("vertexCount", 0)) >= 3
+
+
+def _read_mesh_bounds(rd: dict[str, Any]) -> tuple[float, float, float, float, float] | None:
+    vd = rd.get("m_VertexData")
+    if not isinstance(vd, dict):
+        return None
+
+    try:
+        vcount = int(vd.get("m_VertexCount", 0))
+    except Exception:
+        return None
+    data = vd.get("m_DataSize")
+    if not isinstance(data, (bytes, bytearray)):
+        return None
+    if vcount < 3:
+        return None
+
     pos_size = vcount * 12
     uv_size = vcount * 8
     if len(data) < pos_size + uv_size:
-        return False
+        return None
 
     xs: list[float] = []
     ys: list[float] = []
@@ -510,6 +548,37 @@ def _force_quad_mesh_from_current_bounds(rd: dict[str, Any]) -> bool:
     min_y = min(ys)
     max_y = max(ys)
     z = sum(zs) / len(zs) if zs else 0.0
+    return min_x, max_x, min_y, max_y, z
+
+
+def _pack_vertex_streams_pos_uv(
+    positions: list[tuple[float, float, float]],
+    uvs: list[tuple[float, float]],
+) -> bytes:
+    if len(positions) != len(uvs):
+        raise ValueError("positions/uvs 개수가 일치해야 합니다.")
+
+    out = bytearray()
+    for px, py, pz in positions:
+        out.extend(struct.pack("<fff", px, py, pz))
+
+    # Unity VertexData stream은 stream 경계가 16-byte aligned 입니다.
+    pad = (-len(out)) & 0x0F
+    if pad:
+        out.extend(b"\x00" * pad)
+
+    for u, v in uvs:
+        out.extend(struct.pack("<ff", u, v))
+
+    return bytes(out)
+
+
+def _force_quad_mesh_from_current_bounds(rd: dict[str, Any]) -> bool:
+    bounds = _read_mesh_bounds(rd)
+    if bounds is None:
+        return False
+    min_x, max_x, min_y, max_y, z = bounds
+    vd = cast(dict[str, Any], rd.get("m_VertexData", {}))
 
     # Build 4-vertex rectangle and keep uv all-zero (same style as UnityEX/manual output for this title).
     positions = [
@@ -520,14 +589,8 @@ def _force_quad_mesh_from_current_bounds(rd: dict[str, Any]) -> bool:
     ]
     uvs = [(0.0, 0.0)] * 4
 
-    out = bytearray()
-    for px, py, pz in positions:
-        out.extend(struct.pack("<fff", px, py, pz))
-    for u, v in uvs:
-        out.extend(struct.pack("<ff", u, v))
-
     vd["m_VertexCount"] = 4
-    vd["m_DataSize"] = bytes(out)
+    vd["m_DataSize"] = _pack_vertex_streams_pos_uv(positions, uvs)
     rd["m_VertexData"] = vd
 
     rd["m_IndexBuffer"] = [0, 0, 1, 0, 2, 0, 0, 0, 2, 0, 3, 0]
@@ -555,6 +618,557 @@ def _force_quad_mesh_from_current_bounds(rd: dict[str, Any]) -> bool:
             first["baseVertex"] = 0
             first["firstVertex"] = 0
             first["vertexCount"] = 4
+            sub_meshes[0] = first
+    rd["m_SubMeshes"] = sub_meshes
+    return True
+
+
+def _polygon_area(points: list[tuple[float, float]]) -> float:
+    if len(points) < 3:
+        return 0.0
+    s = 0.0
+    n = len(points)
+    for i in range(n):
+        x1, y1 = points[i]
+        x2, y2 = points[(i + 1) % n]
+        s += (x1 * y2) - (x2 * y1)
+    return 0.5 * s
+
+
+def _point_in_triangle(
+    p: tuple[float, float],
+    a: tuple[float, float],
+    b: tuple[float, float],
+    c: tuple[float, float],
+) -> bool:
+    def sign(p1: tuple[float, float], p2: tuple[float, float], p3: tuple[float, float]) -> float:
+        return (p1[0] - p3[0]) * (p2[1] - p3[1]) - (p2[0] - p3[0]) * (p1[1] - p3[1])
+
+    d1 = sign(p, a, b)
+    d2 = sign(p, b, c)
+    d3 = sign(p, c, a)
+
+    eps = 1e-7
+    has_neg = (d1 < -eps) or (d2 < -eps) or (d3 < -eps)
+    has_pos = (d1 > eps) or (d2 > eps) or (d3 > eps)
+    return not (has_neg and has_pos)
+
+
+def _triangulate_polygon(points: list[tuple[float, float]]) -> list[int] | None:
+    if len(points) < 3:
+        return None
+
+    poly: list[tuple[float, float]] = []
+    for pt in points:
+        if not poly or (abs(poly[-1][0] - pt[0]) > 1e-6 or abs(poly[-1][1] - pt[1]) > 1e-6):
+            poly.append(pt)
+    if len(poly) >= 2 and abs(poly[0][0] - poly[-1][0]) < 1e-6 and abs(poly[0][1] - poly[-1][1]) < 1e-6:
+        poly.pop()
+    if len(poly) < 3:
+        return None
+
+    area = _polygon_area(poly)
+    is_ccw = area > 0.0
+
+    indices = list(range(len(poly)))
+    triangles: list[int] = []
+    guard = 0
+    max_guard = len(indices) * len(indices) * 4
+
+    while len(indices) > 3 and guard < max_guard:
+        ear_found = False
+        m = len(indices)
+
+        for i in range(m):
+            i_prev = indices[(i - 1) % m]
+            i_curr = indices[i]
+            i_next = indices[(i + 1) % m]
+
+            a = poly[i_prev]
+            b = poly[i_curr]
+            c = poly[i_next]
+            cross = ((b[0] - a[0]) * (c[1] - a[1])) - ((b[1] - a[1]) * (c[0] - a[0]))
+            if is_ccw:
+                if cross <= 1e-8:
+                    continue
+            else:
+                if cross >= -1e-8:
+                    continue
+
+            contains = False
+            for j in indices:
+                if j in (i_prev, i_curr, i_next):
+                    continue
+                if _point_in_triangle(poly[j], a, b, c):
+                    contains = True
+                    break
+            if contains:
+                continue
+
+            if is_ccw:
+                triangles.extend([i_prev, i_curr, i_next])
+            else:
+                triangles.extend([i_prev, i_next, i_curr])
+            del indices[i]
+            ear_found = True
+            break
+
+        if not ear_found:
+            return None
+        guard += 1
+
+    if len(indices) == 3:
+        i0, i1, i2 = indices
+        if is_ccw:
+            triangles.extend([i0, i1, i2])
+        else:
+            triangles.extend([i0, i2, i1])
+    return triangles if triangles else None
+
+
+def _decimate_polygon(
+    points: list[tuple[float, float]],
+    *,
+    max_vertices: int,
+) -> list[tuple[float, float]]:
+    if len(points) <= max_vertices:
+        return points
+    step = len(points) / float(max_vertices)
+    out: list[tuple[float, float]] = []
+    used: set[int] = set()
+    for i in range(max_vertices):
+        idx = int(round(i * step))
+        if idx >= len(points):
+            idx = len(points) - 1
+        if idx in used:
+            continue
+        used.add(idx)
+        out.append(points[idx])
+    if len(out) < 3:
+        return points[:max_vertices]
+    return out
+
+
+def _normalize_ring(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    ring: list[tuple[float, float]] = []
+    for x, y in points:
+        fx = float(x)
+        fy = float(y)
+        if not ring or abs(ring[-1][0] - fx) > 1e-6 or abs(ring[-1][1] - fy) > 1e-6:
+            ring.append((fx, fy))
+    if len(ring) >= 2 and abs(ring[0][0] - ring[-1][0]) < 1e-6 and abs(ring[0][1] - ring[-1][1]) < 1e-6:
+        ring.pop()
+    return ring
+
+
+def _extract_polygon_rings_from_alpha_cv2(
+    alpha: Image.Image,
+    *,
+    threshold: int = 1,
+    max_dim: int = 384,
+    epsilon_ratio: float = 0.0025,
+    max_vertices_per_ring: int = 256,
+) -> list[tuple[list[tuple[float, float]], list[list[tuple[float, float]]]]]:
+    if cv2 is None or np is None:
+        return []
+    if alpha.mode != "L":
+        alpha = alpha.convert("L")
+
+    src_w, src_h = alpha.size
+    if src_w <= 0 or src_h <= 0:
+        return []
+
+    scale_x = 1.0
+    scale_y = 1.0
+    work = alpha
+    if max(src_w, src_h) > max_dim:
+        ratio = float(max_dim) / float(max(src_w, src_h))
+        dst_w = max(1, int(round(src_w * ratio)))
+        dst_h = max(1, int(round(src_h * ratio)))
+        work = alpha.resize((dst_w, dst_h), Image.Resampling.BILINEAR)
+        scale_x = float(src_w) / float(dst_w)
+        scale_y = float(src_h) / float(dst_h)
+
+    w, h = work.size
+    arr = np.frombuffer(work.tobytes(), dtype=np.uint8).reshape((h, w))
+    binary = np.where(arr > threshold, 255, 0).astype(np.uint8)
+
+    found = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if len(found) == 2:
+        contours, _ = found
+    else:
+        _, contours, _ = found
+    if not contours:
+        return []
+
+    min_area = max(3.0, float(src_w * src_h) * 0.00002)
+
+    def contour_to_ring(cnt: Any) -> list[tuple[float, float]] | None:
+        if cnt is None or len(cnt) < 3:
+            return None
+        peri = float(cv2.arcLength(cnt, True))
+        eps = max(0.8, peri * epsilon_ratio)
+        approx = cv2.approxPolyDP(cnt, eps, True)
+        used = approx if approx is not None and len(approx) >= 3 else cnt
+        pts = [(float(p[0][0]) * scale_x, float(p[0][1]) * scale_y) for p in used]
+        ring = _normalize_ring(pts)
+        if len(ring) < 3:
+            return None
+        ring = _decimate_polygon(ring, max_vertices=max_vertices_per_ring)
+        if len(ring) < 3:
+            return None
+        if abs(_polygon_area(ring)) < min_area:
+            return None
+        return ring
+
+    groups: list[tuple[list[tuple[float, float]], list[list[tuple[float, float]]]]] = []
+    for cnt in contours:
+        outer = contour_to_ring(cnt)
+        if outer is None:
+            continue
+        groups.append((outer, []))
+
+    groups.sort(key=lambda g: abs(_polygon_area(g[0])), reverse=True)
+    return groups
+
+
+def _triangulate_rings_with_earcut(
+    outer: list[tuple[float, float]],
+    holes: list[list[tuple[float, float]]],
+) -> tuple[list[tuple[float, float]], list[int]] | None:
+    if np is None or earcut is None:
+        return None
+
+    rings: list[list[tuple[float, float]]] = []
+    outer_n = _normalize_ring(outer)
+    if len(outer_n) < 3:
+        return None
+    rings.append(outer_n)
+
+    for hole in holes:
+        hole_n = _normalize_ring(hole)
+        if len(hole_n) >= 3:
+            rings.append(hole_n)
+
+    vertices: list[tuple[float, float]] = []
+    ring_ends: list[int] = []
+    for ring in rings:
+        vertices.extend(ring)
+        ring_ends.append(len(vertices))
+
+    if len(vertices) < 3:
+        return None
+
+    try:
+        verts_np = np.asarray(vertices, dtype=np.float64)
+        ends_np = np.asarray(ring_ends, dtype=np.uint32)
+        tri = earcut.triangulate_float64(verts_np, ends_np)
+        tri_list = [int(x) for x in tri.tolist()]
+    except Exception:
+        return None
+
+    if not tri_list:
+        return None
+    return vertices, tri_list
+
+
+def _sprite_mesh_uv_is_zero(rd: dict[str, Any]) -> bool:
+    vd = rd.get("m_VertexData")
+    if not isinstance(vd, dict):
+        return False
+    try:
+        vcount = int(vd.get("m_VertexCount", 0))
+    except Exception:
+        return False
+    data = vd.get("m_DataSize")
+    if not isinstance(data, (bytes, bytearray)):
+        return False
+    if vcount <= 0:
+        return False
+
+    pos_size = vcount * 12
+    uv_off = (pos_size + 15) & ~15
+    uv_size = vcount * 8
+    if len(data) < uv_off + uv_size:
+        return False
+
+    sample_count = min(vcount, 4096)
+    for i in range(sample_count):
+        u, v = struct.unpack_from("<ff", data, uv_off + (i * 8))
+        if abs(float(u)) > 1e-6 or abs(float(v)) > 1e-6:
+            return False
+    return True
+
+
+def _extract_polygons_from_alpha(
+    alpha: Image.Image,
+    *,
+    threshold: int = 8,
+    max_dim: int = 192,
+    max_vertices_per_polygon: int = 256,
+) -> list[list[tuple[float, float]]]:
+    if alpha.mode != "L":
+        alpha = alpha.convert("L")
+    src_w, src_h = alpha.size
+    if src_w <= 0 or src_h <= 0:
+        return []
+
+    scale_x = 1.0
+    scale_y = 1.0
+    work = alpha
+    if max(src_w, src_h) > max_dim:
+        ratio = float(max_dim) / float(max(src_w, src_h))
+        dst_w = max(1, int(round(src_w * ratio)))
+        dst_h = max(1, int(round(src_h * ratio)))
+        work = alpha.resize((dst_w, dst_h), Image.Resampling.BILINEAR)
+        scale_x = float(src_w) / float(dst_w)
+        scale_y = float(src_h) / float(dst_h)
+
+    w, h = work.size
+    buf = work.tobytes()
+
+    def opaque(x: int, y: int) -> bool:
+        return buf[y * w + x] > threshold
+
+    edges: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    for y in range(h):
+        for x in range(w):
+            if not opaque(x, y):
+                continue
+            if y == 0 or not opaque(x, y - 1):
+                edges.append(((x, y), (x + 1, y)))
+            if x == w - 1 or not opaque(x + 1, y):
+                edges.append(((x + 1, y), (x + 1, y + 1)))
+            if y == h - 1 or not opaque(x, y + 1):
+                edges.append(((x + 1, y + 1), (x, y + 1)))
+            if x == 0 or not opaque(x - 1, y):
+                edges.append(((x, y + 1), (x, y)))
+
+    if not edges:
+        return []
+
+    next_map: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for start, end in edges:
+        arr = next_map.setdefault(start, [])
+        if end not in arr:
+            arr.append(end)
+    for arr in next_map.values():
+        arr.sort()
+
+    visited_edges: set[tuple[tuple[int, int], tuple[int, int]]] = set()
+    loops: list[list[tuple[int, int]]] = []
+    total_edges = len(edges)
+    for start, ends in next_map.items():
+        for end in ends:
+            edge0 = (start, end)
+            if edge0 in visited_edges:
+                continue
+
+            loop: list[tuple[int, int]] = [start]
+            curr = start
+            nxt = end
+            guard = 0
+            max_guard = total_edges + 8
+            while guard < max_guard:
+                edge = (curr, nxt)
+                if edge in visited_edges:
+                    break
+                visited_edges.add(edge)
+                curr = nxt
+                loop.append(curr)
+                if curr == loop[0]:
+                    break
+
+                candidates = next_map.get(curr, [])
+                next_unused: tuple[int, int] | None = None
+                for cand in candidates:
+                    if (curr, cand) not in visited_edges:
+                        next_unused = cand
+                        break
+                if next_unused is None:
+                    break
+                nxt = next_unused
+                guard += 1
+
+            if len(loop) >= 4 and loop[0] == loop[-1]:
+                loops.append(loop[:-1])
+
+    if not loops:
+        return []
+
+    min_area = max(4.0, float(w * h) * 0.00005)
+    polygons: list[list[tuple[float, float]]] = []
+    for loop in loops:
+        if len(loop) < 3:
+            continue
+        area = abs(_polygon_area([(float(px), float(py)) for px, py in loop]))
+        if area < min_area:
+            continue
+
+        collapsed: list[tuple[int, int]] = []
+        n = len(loop)
+        for i in range(n):
+            a = loop[(i - 1) % n]
+            b = loop[i]
+            c = loop[(i + 1) % n]
+            cross = ((b[0] - a[0]) * (c[1] - b[1])) - ((b[1] - a[1]) * (c[0] - b[0]))
+            if abs(float(cross)) <= 1e-9:
+                continue
+            collapsed.append(b)
+        if len(collapsed) >= 3:
+            loop = collapsed
+
+        poly = [(float(px) * scale_x, float(py) * scale_y) for px, py in loop]
+        poly = _decimate_polygon(poly, max_vertices=max_vertices_per_polygon)
+        if len(poly) < 3:
+            continue
+        polygons.append(poly)
+
+    polygons.sort(key=lambda pts: abs(_polygon_area(pts)), reverse=True)
+    return polygons
+
+
+def _force_tight_mesh_from_alpha(
+    rd: dict[str, Any],
+    alpha: Image.Image,
+    *,
+    bounds_override: tuple[float, float, float, float, float] | None = None,
+) -> bool:
+    bounds = bounds_override if bounds_override is not None else _read_mesh_bounds(rd)
+    if bounds is None:
+        return False
+    min_x, max_x, min_y, max_y, z = bounds
+    vd = rd.get("m_VertexData")
+    if not isinstance(vd, dict):
+        return False
+
+    if alpha.mode != "L":
+        alpha = alpha.convert("L")
+    tex_w, tex_h = alpha.size
+    if tex_w <= 0 or tex_h <= 0:
+        return False
+
+    use_zero_uv = _sprite_mesh_uv_is_zero(rd)
+
+    groups = _extract_polygon_rings_from_alpha_cv2(
+        alpha,
+        threshold=1,
+        max_dim=384,
+        epsilon_ratio=0.0010,
+        max_vertices_per_ring=512,
+    )
+    if not groups:
+        # fallback without external deps
+        polygons = _extract_polygons_from_alpha(alpha, threshold=1, max_dim=192, max_vertices_per_polygon=256)
+        groups = [(poly, []) for poly in polygons]
+    if not groups:
+        return False
+
+    span_x = max_x - min_x
+    span_y = max_y - min_y
+    tw = float(max(1, tex_w))
+    th = float(max(1, tex_h))
+
+    positions: list[tuple[float, float, float]] = []
+    uvs: list[tuple[float, float]] = []
+    triangles: list[int] = []
+    for outer, holes in groups:
+        tri_pack = _triangulate_rings_with_earcut(outer, holes)
+        if tri_pack is not None:
+            local_vertices2d, local_triangles = tri_pack
+        else:
+            local_vertices2d = _normalize_ring(outer)
+            local_triangles = _triangulate_polygon(local_vertices2d)
+            if local_triangles is None or len(local_triangles) < 3:
+                continue
+
+        local_positions: list[tuple[float, float, float]] = []
+        local_uvs: list[tuple[float, float]] = []
+        for px, py in local_vertices2d:
+            nx = float(px) / tw
+            ny = float(py) / th
+            vx = min_x + (nx * span_x)
+            vy = max_y - (ny * span_y)
+            local_positions.append((vx, vy, z))
+            if use_zero_uv:
+                local_uvs.append((0.0, 0.0))
+            else:
+                local_uvs.append((nx, 1.0 - ny))
+
+        if not local_positions:
+            continue
+
+        i0, i1, i2 = local_triangles[0], local_triangles[1], local_triangles[2]
+        a = local_positions[i0]
+        b = local_positions[i1]
+        c = local_positions[i2]
+        tri_cross = ((b[0] - a[0]) * (c[1] - a[1])) - ((b[1] - a[1]) * (c[0] - a[0]))
+        if tri_cross > 0.0:
+            for i in range(0, len(local_triangles), 3):
+                local_triangles[i + 1], local_triangles[i + 2] = local_triangles[i + 2], local_triangles[i + 1]
+
+        base_idx = len(positions)
+        if base_idx + len(local_positions) > 65535:
+            break
+        positions.extend(local_positions)
+        uvs.extend(local_uvs)
+        for idx in local_triangles:
+            triangles.append(base_idx + int(idx))
+
+    if not positions or not triangles:
+        return False
+
+    # Keep sprite-local origin stable for UnityPy/runtime mask paths:
+    # SpriteHelper normalizes mesh positions by global min(x/y) across all vertices.
+    # If tight mesh vertices only cover opaque bbox, the mask is shifted.
+    # Add 4 unreferenced anchors at textureRect bounds so min(x/y) == rect origin.
+    if len(positions) + 4 <= 65535:
+        if use_zero_uv:
+            anchor_uvs = [(0.0, 0.0)] * 4
+        else:
+            anchor_uvs = [(0.0, 1.0), (0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]
+        anchor_positions = [
+            (min_x, min_y, z),
+            (min_x, max_y, z),
+            (max_x, max_y, z),
+            (max_x, min_y, z),
+        ]
+        positions = anchor_positions + positions
+        uvs = anchor_uvs + uvs
+        triangles = [int(idx) + 4 for idx in triangles]
+
+    vd["m_VertexCount"] = len(positions)
+    vd["m_DataSize"] = _pack_vertex_streams_pos_uv(positions, uvs)
+    rd["m_VertexData"] = vd
+
+    idx_bytes = bytearray()
+    for idx in triangles:
+        idx_bytes.extend(struct.pack("<H", int(idx)))
+    rd["m_IndexBuffer"] = list(idx_bytes)
+
+    sub_meshes = rd.get("m_SubMeshes")
+    if not isinstance(sub_meshes, list) or not sub_meshes:
+        sub_meshes = [{
+            "firstByte": 0,
+            "indexCount": len(triangles),
+            "topology": 0,
+            "baseVertex": 0,
+            "firstVertex": 0,
+            "vertexCount": len(positions),
+            "localAABB": {
+                "m_Center": {"x": 0.0, "y": 0.0, "z": 0.0},
+                "m_Extent": {"x": 0.0, "y": 0.0, "z": 0.0},
+            },
+        }]
+    else:
+        first = sub_meshes[0]
+        if isinstance(first, dict):
+            first["firstByte"] = 0
+            first["indexCount"] = len(triangles)
+            first["topology"] = int(first.get("topology", 0))
+            first["baseVertex"] = 0
+            first["firstVertex"] = 0
+            first["vertexCount"] = len(positions)
             sub_meshes[0] = first
     rd["m_SubMeshes"] = sub_meshes
     return True
@@ -597,6 +1211,99 @@ def apply_sprite_mode_and_rect(
     tree["m_RD"] = rd
     sprite_obj.save_typetree(tree)
     return before, after
+
+
+def apply_tightmesh_mode_and_mesh(
+    sprite_obj: Any,
+    *,
+    tight_rect: tuple[int, int, int, int],
+    alpha: Image.Image,
+) -> tuple[int, int, bool]:
+    tree = sprite_obj.read_typetree()
+    rd = cast(dict[str, Any], tree.get("m_RD", {}))
+
+    before = int(rd.get("settingsRaw", 0))
+    after = convert_settings_raw(before, "tightmesh")
+    rd["settingsRaw"] = after
+
+    x, y, w, h = tight_rect
+    texture_rect = cast(dict[str, Any], rd.get("textureRect", {}))
+    texture_rect["x"] = float(x)
+    texture_rect["y"] = float(y)
+    texture_rect["width"] = float(w)
+    texture_rect["height"] = float(h)
+    rd["textureRect"] = texture_rect
+
+    texture_rect_offset = cast(dict[str, Any], rd.get("textureRectOffset", {}))
+    texture_rect_offset["x"] = float(x)
+    texture_rect_offset["y"] = float(y)
+    rd["textureRectOffset"] = texture_rect_offset
+
+    z = 0.0
+    prev_bounds = _read_mesh_bounds(rd)
+    if prev_bounds is not None:
+        z = prev_bounds[4]
+
+    ppu_raw = tree.get("m_PixelsToUnits", 100.0)
+    try:
+        ppu = float(ppu_raw)
+    except Exception:
+        ppu = 100.0
+    if ppu <= 0.0:
+        ppu = 100.0
+
+    pivot_raw = cast(dict[str, Any], tree.get("m_Pivot", {"x": 0.5, "y": 0.5}))
+    try:
+        pivot_x = float(pivot_raw.get("x", 0.5))
+    except Exception:
+        pivot_x = 0.5
+    try:
+        pivot_y = float(pivot_raw.get("y", 0.5))
+    except Exception:
+        pivot_y = 0.5
+
+    # Some formats store pivot normalized [0..1], others in pixels.
+    if pivot_x > 1.0:
+        pivot_x = pivot_x / float(max(1, w))
+    if pivot_y > 1.0:
+        pivot_y = pivot_y / float(max(1, h))
+    pivot_x = min(max(pivot_x, 0.0), 1.0)
+    pivot_y = min(max(pivot_y, 0.0), 1.0)
+
+    full_rect = cast(dict[str, Any], tree.get("m_Rect", {}))
+    try:
+        full_x = float(full_rect.get("x", 0.0))
+    except Exception:
+        full_x = 0.0
+    try:
+        full_y = float(full_rect.get("y", 0.0))
+    except Exception:
+        full_y = 0.0
+    try:
+        full_w = float(full_rect.get("width", float(w)))
+    except Exception:
+        full_w = float(w)
+    try:
+        full_h = float(full_rect.get("height", float(h)))
+    except Exception:
+        full_h = float(h)
+
+    pivot_px = full_x + (full_w * pivot_x)
+    pivot_py = full_y + (full_h * pivot_y)
+
+    min_x = (float(x) - pivot_px) / ppu
+    max_x = (float(x + w) - pivot_px) / ppu
+    min_y = (float(y) - pivot_py) / ppu
+    max_y = (float(y + h) - pivot_py) / ppu
+
+    mesh_ok = _force_tight_mesh_from_alpha(
+        rd,
+        alpha,
+        bounds_override=(min_x, max_x, min_y, max_y, z),
+    )
+    tree["m_RD"] = rd
+    sprite_obj.save_typetree(tree)
+    return before, after, mesh_ok
 
 
 def update_atlas_settings(sprite: Any, mode: Mode) -> None:
@@ -834,6 +1541,52 @@ def replace_sprites_in_assets_file(
             texture.save()
             before, after = apply_sprite_mode_and_rect(obj, mode="fullrect", tight_rect=(full_x, full_y, full_w, full_h))
             update_atlas_settings(sprite, mode="fullrect")
+        elif target_mode == "tightmesh":
+            if replacement.size == (base_w, base_h):
+                write_x, write_y_top, write_w, write_h = base_x, base_y_top, base_w, base_h
+                fitted = replacement
+            else:
+                current_base_crop = texture_image.crop((base_x, base_y_top, base_x + base_w, base_y_top + base_h))
+                current_bbox = current_base_crop.getchannel("A").getbbox()
+                if current_bbox is not None:
+                    cbx0, cby0, cbx1, cby1 = current_bbox
+                    cbw = max(1, cbx1 - cbx0)
+                    cbh = max(1, cby1 - cby0)
+                    fitted = replacement if replacement.size == (cbw, cbh) else replacement.resize((cbw, cbh), Image.Resampling.LANCZOS)
+                    write_x = base_x + cbx0
+                    write_y_top = base_y_top + cby0
+                    write_w, write_h = cbw, cbh
+                else:
+                    # Fallback: place replacement at base origin without upscaling to full base rect.
+                    rw, rh = replacement.size
+                    write_x, write_y_top = base_x, base_y_top
+                    write_w = max(1, min(rw, texture_image.width - write_x))
+                    write_h = max(1, min(rh, texture_image.height - write_y_top))
+                    fitted = replacement if replacement.size == (write_w, write_h) else replacement.resize((write_w, write_h), Image.Resampling.LANCZOS)
+            tight_y = texture_image.height - (write_y_top + write_h)
+
+            if changed_only:
+                current_crop = texture_image.crop((write_x, write_y_top, write_x + write_w, write_y_top + write_h))
+                expected_raw = convert_settings_raw(raw_now, "tightmesh")
+                rect_ok = (rect_now_x, rect_now_y, rect_now_w, rect_now_h) == (write_x, tight_y, write_w, write_h)
+                mesh_ok = _is_tight_mesh(rd_now) and not _is_quad_mesh(rd_now)
+                if image_equal(current_crop, fitted) and raw_now == expected_raw and rect_ok and mesh_ok:
+                    skipped_same += 1
+                    continue
+
+            texture_image.paste((0, 0, 0, 0), (base_x, base_y_top, base_x + base_w, base_y_top + base_h))
+            texture_image.paste(fitted, (write_x, write_y_top))
+            texture.set_image(texture_image)
+            texture.save()
+
+            before, after, mesh_ok = apply_tightmesh_mode_and_mesh(
+                obj,
+                tight_rect=(write_x, tight_y, write_w, write_h),
+                alpha=fitted.getchannel("A"),
+            )
+            if not mesh_ok:
+                print(f"[경고] tightmesh 생성 실패, 기존 메쉬를 유지합니다: {assets_file.name}:{path_id}:{sprite_name}")
+            update_atlas_settings(sprite, mode="tightmesh")
         else:
             fitted = replacement if replacement.size == (base_w, base_h) else replacement.resize((base_w, base_h), Image.Resampling.LANCZOS)
             alpha = fitted.getchannel("A")
@@ -973,7 +1726,7 @@ def ask_choice(prompt: str, valid: set[str]) -> str:
 
 
 def main_cli(lang: Language = "ko") -> None:
-    description = "Unity Sprite 교체/추출 도구 (fullrect + tightclip)"
+    description = "Unity Sprite 교체/추출 도구 (fullrect + tightclip + tightmesh)"
     parser = argparse.ArgumentParser(
         description=description,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -983,6 +1736,7 @@ def main_cli(lang: Language = "ko") -> None:
   %(prog)s --gamepath "D:\\Games\\SomeGame_Data\\sharedassets0.assets" --extract-all --ids "sharedassets0.assets:186"
   %(prog)s --gamepath "D:\\Games\\SomeGame" --list sprites.json --mode fullrect
   %(prog)s --gamepath "D:\\Games\\SomeGame" --list sprites.json --mode tightclip
+  %(prog)s --gamepath "D:\\Games\\SomeGame" --list sprites.json --mode tightmesh
   %(prog)s --gamepath "D:\\Games\\SomeGame" --replace-dir ".\\sprites" --mode fullrect
         """,
     )
@@ -995,7 +1749,7 @@ def main_cli(lang: Language = "ko") -> None:
     parser.add_argument("--ids", "--id", dest="ids", action="append", help="파일명:PathID 필터. 콤마로 여러 개 지정 가능")
     parser.add_argument("--name", "--names", dest="name", action="append", help="Sprite 이름 필터. 콤마로 여러 개 지정 가능")
     parser.add_argument("--name-contains", action="append", help="Sprite 이름 부분일치 필터. 콤마로 여러 개 지정 가능")
-    parser.add_argument("--mode", choices=["fullrect", "tightclip"], default="fullrect", help="교체 모드 기본값")
+    parser.add_argument("--mode", choices=["fullrect", "tightclip", "tightmesh"], default="fullrect", help="교체 모드 기본값")
     parser.add_argument("--output-dir", type=str, help="추출 PNG 출력 폴더")
     parser.add_argument("--json-out", type=str, help="JSON 출력 파일 경로")
     parser.add_argument("--skip-missing", default=True, action=argparse.BooleanOptionalAction, help="없는 Replace_to 파일은 스킵 (기본: 켜짐)")

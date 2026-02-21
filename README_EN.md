@@ -17,6 +17,7 @@ This document is written with **PyInstaller-built EXE usage** as the default.
 6. Replacement modes
    - `fullrect`: force FullRect
    - `tightclip`: clip tightly to image alpha bounding box
+   - `tightmesh`: clip with a polygon mesh generated from image alpha outline
 
 ## Executables
 
@@ -30,7 +31,7 @@ If you downloaded a release package, run these directly:
 If you want to build from source:
 
 ```bash
-py -3.12 -m pip install -U pyinstaller UnityPy Pillow
+py -3.12 -m pip install -U pyinstaller UnityPy Pillow opencv-python-headless mapbox-earcut numpy
 py -3.12 -m PyInstaller --onefile --name unity_sprite_fullrect_replacer unity_sprite_fullrect_replacer.py
 py -3.12 -m PyInstaller --onefile --name unity_sprite_fullrect_replacer_en unity_sprite_fullrect_replacer_en.py
 py -3.12 -m PyInstaller --onefile --name UABEA_sprite_json_edit UABEA_sprite_json_edit.py
@@ -61,7 +62,7 @@ Option groups:
 - `--gamepath PATH`
   - Game root / `_Data` / single `.assets` file path
   - Default: none (prompts during execution if omitted)
-- `--mode fullrect|tightclip`
+- `--mode fullrect|tightclip|tightmesh`
   - Default replacement mode
   - Default: `fullrect`
 - `--verbose`
@@ -145,7 +146,12 @@ unity_sprite_fullrect_replacer_en.exe --gamepath "D:\Games\Game" --list ".\sprit
 unity_sprite_fullrect_replacer_en.exe --gamepath "D:\Games\Game" --list ".\sprites.json" --mode tightclip
 ```
 
-7. Filename-based replacement (without JSON)
+7. JSON-based replacement (tightmesh)
+```bat
+unity_sprite_fullrect_replacer_en.exe --gamepath "D:\Games\Game" --list ".\sprites.json" --mode tightmesh
+```
+
+8. Filename-based replacement (without JSON)
 ```bat
 unity_sprite_fullrect_replacer_en.exe --gamepath "D:\Games\Game" --replace-dir ".\sprites" --mode fullrect
 ```
@@ -229,6 +235,8 @@ UABEA_sprite_json_edit_en.exe --dir "C:\path\to\json_folder" --recursive
 - `Managed` folder is not required for Sprite-only modifications.
 - Input path supports game root / `_Data` / single `.assets` file.
 - In `fullrect` replacement, the tool updates `textureRect/textureRectOffset` to match `m_Rect` together with `settingsRaw`.
+- `tightmesh` writes an alpha-outline polygon mesh into `m_VertexData/m_IndexBuffer/m_SubMeshes`.
+  - For better `tightmesh` quality, `opencv-python-headless`, `mapbox-earcut`, and `numpy` are recommended.
 - When `--gamepath` is a game root or `_Data` folder, the tool prioritizes top-level `.assets` files in `_Data`.
   (Backup copies under subfolders such as `Original`/`backup` are excluded from default scan.)
 - If a Texture2D `.resS` resource is missing, that entry is skipped instead of aborting the entire run.
