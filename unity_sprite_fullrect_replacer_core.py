@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Literal, NoReturn, cast
 
 import UnityPy
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageFilter
 
 try:
     import cv2  # type: ignore
@@ -87,15 +87,38 @@ def get_script_dir() -> Path:
 
 
 def find_assets_files(data_path: Path) -> list[Path]:
-    # 기본은 _Data 최상위의 표준 Unity assets 집합을 사용합니다.
-    # (예: Original/backup 폴더의 복사본까지 재귀로 잡히는 것을 방지)
-    top_level = [p for p in data_path.glob("*.assets") if p.is_file()]
-    top_level.sort()
-    if top_level:
-        return top_level
-
-    # 예외적으로 최상위에 없을 때만 재귀 탐색합니다.
-    assets_files = [p for p in data_path.rglob("*.assets") if p.is_file()]
+    # Unity_Font_Replacer와 동일하게 _Data 전체를 기본 재귀 스캔합니다.
+    # 확장자로 확실히 비에셋인 파일만 제외하고, 나머지는 UnityPy 로드 시도 대상으로 둡니다.
+    exclude_exts = {
+        ".dll",
+        ".manifest",
+        ".exe",
+        ".txt",
+        ".json",
+        ".xml",
+        ".log",
+        ".ini",
+        ".cfg",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".bmp",
+        ".wav",
+        ".mp3",
+        ".ogg",
+        ".mp4",
+        ".avi",
+        ".mov",
+        ".ress",
+    }
+    assets_files: list[Path] = []
+    for p in data_path.rglob("*"):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() in exclude_exts:
+            continue
+        assets_files.append(p)
     assets_files.sort()
     return assets_files
 
@@ -103,10 +126,8 @@ def find_assets_files(data_path: Path) -> list[Path]:
 def resolve_input_path(input_path: str) -> tuple[Path, Path, list[Path]]:
     p = Path(input_path).expanduser().resolve()
 
-    # 단일 assets 파일 입력 허용
+    # 단일 에셋 파일 입력 허용 (확장자 제한 없음)
     if p.is_file():
-        if p.suffix.lower() != ".assets":
-            raise FileNotFoundError(f"지원하지 않는 파일 형식입니다: {p}")
         data_path = p.parent
         game_path = data_path.parent if data_path.name.lower().endswith("_data") else data_path
         return game_path, data_path, [p]
@@ -126,7 +147,7 @@ def resolve_input_path(input_path: str) -> tuple[Path, Path, list[Path]]:
 
     assets_files = find_assets_files(data_path)
     if not assets_files:
-        raise FileNotFoundError(f"에셋 파일(.assets)을 찾을 수 없습니다: {data_path}")
+        raise FileNotFoundError(f"처리 가능한 에셋 파일을 찾을 수 없습니다: {data_path}")
     return game_path, data_path, assets_files
 
 
@@ -309,7 +330,11 @@ def load_sprite_records(
     records: dict[str, JsonDict] = {}
 
     for assets_file in assets_files:
-        env = UnityPy.load(str(assets_file))
+        try:
+            env = UnityPy.load(str(assets_file))
+        except Exception as e:
+            print(f"[스킵] UnityPy.load 실패: {assets_file.name} ({e})")
+            continue
         file_name = assets_file.name
         found_in_file = 0
 
@@ -393,7 +418,11 @@ def extract_sprites(
     exported = 0
 
     for assets_file in assets_files:
-        env = UnityPy.load(str(assets_file))
+        try:
+            env = UnityPy.load(str(assets_file))
+        except Exception as e:
+            print(f"[스킵] UnityPy.load 실패: {assets_file.name} ({e})")
+            continue
         file_name = assets_file.name
         file_count = 0
 
@@ -573,14 +602,85 @@ def _pack_vertex_streams_pos_uv(
     return bytes(out)
 
 
-def _force_quad_mesh_from_current_bounds(rd: dict[str, Any]) -> bool:
+def _force_quad_mesh_from_sprite_rect(
+    rd: dict[str, Any],
+    tree: dict[str, Any],
+    *,
+    rect_xywh: tuple[int, int, int, int] | None,
+) -> bool:
     bounds = _read_mesh_bounds(rd)
     if bounds is None:
         return False
-    min_x, max_x, min_y, max_y, z = bounds
-    vd = cast(dict[str, Any], rd.get("m_VertexData", {}))
+    _old_min_x, _old_max_x, _old_min_y, _old_max_y, z = bounds
 
-    # Build 4-vertex rectangle and keep uv all-zero (same style as UnityEX/manual output for this title).
+    if rect_xywh is None:
+        texture_rect = cast(dict[str, Any], rd.get("textureRect", {}))
+        try:
+            x = int(round(float(texture_rect.get("x", 0.0))))
+            y = int(round(float(texture_rect.get("y", 0.0))))
+            w = int(round(float(texture_rect.get("width", 0.0))))
+            h = int(round(float(texture_rect.get("height", 0.0))))
+        except Exception:
+            return False
+    else:
+        x, y, w, h = rect_xywh
+
+    if w <= 0 or h <= 0:
+        return False
+
+    ppu_raw = tree.get("m_PixelsToUnits", 100.0)
+    try:
+        ppu = float(ppu_raw)
+    except Exception:
+        ppu = 100.0
+    if ppu <= 0.0:
+        ppu = 100.0
+
+    pivot_raw = cast(dict[str, Any], tree.get("m_Pivot", {"x": 0.5, "y": 0.5}))
+    try:
+        pivot_x = float(pivot_raw.get("x", 0.5))
+    except Exception:
+        pivot_x = 0.5
+    try:
+        pivot_y = float(pivot_raw.get("y", 0.5))
+    except Exception:
+        pivot_y = 0.5
+    # Some formats store pivot as pixels instead of normalized 0..1.
+    if pivot_x > 1.0:
+        pivot_x = pivot_x / float(max(1, w))
+    if pivot_y > 1.0:
+        pivot_y = pivot_y / float(max(1, h))
+    pivot_x = min(max(pivot_x, 0.0), 1.0)
+    pivot_y = min(max(pivot_y, 0.0), 1.0)
+
+    full_rect = cast(dict[str, Any], tree.get("m_Rect", {}))
+    try:
+        full_x = float(full_rect.get("x", 0.0))
+    except Exception:
+        full_x = 0.0
+    try:
+        full_y = float(full_rect.get("y", 0.0))
+    except Exception:
+        full_y = 0.0
+    try:
+        full_w = float(full_rect.get("width", float(w)))
+    except Exception:
+        full_w = float(w)
+    try:
+        full_h = float(full_rect.get("height", float(h)))
+    except Exception:
+        full_h = float(h)
+
+    pivot_px = full_x + (full_w * pivot_x)
+    pivot_py = full_y + (full_h * pivot_y)
+
+    min_x = (float(x) - pivot_px) / ppu
+    max_x = (float(x + w) - pivot_px) / ppu
+    min_y = (float(y) - pivot_py) / ppu
+    max_y = (float(y + h) - pivot_py) / ppu
+
+    vd = cast(dict[str, Any], rd.get("m_VertexData", {}))
+    # Build 4-vertex rectangle and keep uv all-zero (tooling-compatible import style).
     positions = [
         (min_x, min_y, z),
         (min_x, max_y, z),
@@ -766,7 +866,7 @@ def _extract_polygon_rings_from_alpha_cv2(
     *,
     threshold: int = 1,
     max_dim: int = 384,
-    epsilon_ratio: float = 0.0025,
+    epsilon_ratio: float = 0.00025,
     max_vertices_per_ring: int = 256,
 ) -> list[tuple[list[tuple[float, float]], list[list[tuple[float, float]]]]]:
     if cv2 is None or np is None:
@@ -793,7 +893,7 @@ def _extract_polygon_rings_from_alpha_cv2(
     arr = np.frombuffer(work.tobytes(), dtype=np.uint8).reshape((h, w))
     binary = np.where(arr > threshold, 255, 0).astype(np.uint8)
 
-    found = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    found = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if len(found) == 2:
         contours, _ = found
     else:
@@ -807,7 +907,7 @@ def _extract_polygon_rings_from_alpha_cv2(
         if cnt is None or len(cnt) < 3:
             return None
         peri = float(cv2.arcLength(cnt, True))
-        eps = max(0.8, peri * epsilon_ratio)
+        eps = max(0.05, peri * epsilon_ratio)
         approx = cv2.approxPolyDP(cnt, eps, True)
         used = approx if approx is not None and len(approx) >= 3 else cnt
         pts = [(float(p[0][0]) * scale_x, float(p[0][1]) * scale_y) for p in used]
@@ -1044,30 +1144,45 @@ def _force_tight_mesh_from_alpha(
 
     if alpha.mode != "L":
         alpha = alpha.convert("L")
-    tex_w, tex_h = alpha.size
+    # tightmesh는 조금 넓게 잡아 누락 픽셀이 생기지 않도록 alpha를 확장합니다.
+    alpha_mesh = alpha
+    dilate_px = 5
+    if dilate_px > 0:
+        if cv2 is not None and np is not None:
+            arr = np.frombuffer(alpha.tobytes(), dtype=np.uint8).reshape((alpha.height, alpha.width))
+            binary = np.where(arr > 0, 255, 0).astype(np.uint8)
+            kernel_size = (dilate_px * 2) + 1
+            kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+            binary = cv2.dilate(binary, kernel, iterations=1)
+            alpha_mesh = Image.fromarray(binary, mode="L")
+        else:
+            kernel_size = (dilate_px * 2) + 1
+            alpha_mesh = alpha.filter(ImageFilter.MaxFilter(kernel_size))
+
+    tex_w, tex_h = alpha_mesh.size
     if tex_w <= 0 or tex_h <= 0:
         return False
 
     use_zero_uv = _sprite_mesh_uv_is_zero(rd)
 
     groups = _extract_polygon_rings_from_alpha_cv2(
-        alpha,
-        threshold=1,
+        alpha_mesh,
+        threshold=0,
         max_dim=384,
-        epsilon_ratio=0.0010,
-        max_vertices_per_ring=512,
+        epsilon_ratio=0.00025,
+        max_vertices_per_ring=2048,
     )
     if not groups:
         # fallback without external deps
-        polygons = _extract_polygons_from_alpha(alpha, threshold=1, max_dim=192, max_vertices_per_polygon=256)
+        polygons = _extract_polygons_from_alpha(alpha_mesh, threshold=0, max_dim=192, max_vertices_per_polygon=256)
         groups = [(poly, []) for poly in polygons]
     if not groups:
         return False
 
     span_x = max_x - min_x
     span_y = max_y - min_y
-    tw = float(max(1, tex_w))
-    th = float(max(1, tex_h))
+    tw = float(max(1, tex_w - 1))
+    th = float(max(1, tex_h - 1))
 
     positions: list[tuple[float, float, float]] = []
     uvs: list[tuple[float, float]] = []
@@ -1087,6 +1202,8 @@ def _force_tight_mesh_from_alpha(
         for px, py in local_vertices2d:
             nx = float(px) / tw
             ny = float(py) / th
+            nx = min(max(nx, 0.0), 1.0)
+            ny = min(max(ny, 0.0), 1.0)
             vx = min_x + (nx * span_x)
             vy = max_y - (ny * span_y)
             local_positions.append((vx, vy, z))
@@ -1201,12 +1318,16 @@ def apply_sprite_mode_and_rect(
         rd["textureRect"] = texture_rect
 
         texture_rect_offset = cast(dict[str, Any], rd.get("textureRectOffset", {}))
-        texture_rect_offset["x"] = float(x)
-        texture_rect_offset["y"] = float(y)
+        if mode == "fullrect":
+            texture_rect_offset["x"] = 0.0
+            texture_rect_offset["y"] = 0.0
+        else:
+            texture_rect_offset["x"] = float(x)
+            texture_rect_offset["y"] = float(y)
         rd["textureRectOffset"] = texture_rect_offset
 
-    if mode == "fullrect":
-        _force_quad_mesh_from_current_bounds(rd)
+    if mode in ("fullrect", "tightclip"):
+        _force_quad_mesh_from_sprite_rect(rd, tree, rect_xywh=tight_rect)
 
     tree["m_RD"] = rd
     sprite_obj.save_typetree(tree)
@@ -1408,7 +1529,11 @@ def replace_sprites_in_assets_file(
     skip_missing: bool,
     changed_only: bool,
 ) -> tuple[int, int, int]:
-    env = UnityPy.load(str(assets_file))
+    try:
+        env = UnityPy.load(str(assets_file))
+    except Exception as e:
+        print(f"[스킵] UnityPy.load 실패: {assets_file.name} ({e})")
+        return 0, 0, 0
     file_lower = assets_file.name.lower()
     texture_cache: dict[int, Any] = {}
 
@@ -1516,20 +1641,42 @@ def replace_sprites_in_assets_file(
             full_y_top = base_y_top
 
         if target_mode == "fullrect":
-            # fullrect는 m_Rect 기준으로 metadata를 맞추고, 실제 픽셀 기록은 입력 이미지 크기에 따라 안전하게 처리합니다.
-            # - 입력이 m_Rect와 동일하면 m_Rect 전체를 덮어씁니다.
-            # - 입력이 기존 textureRect와 동일하면 기존 영역만 덮어씁니다(왜곡 방지).
-            if replacement.size == (full_w, full_h):
-                write_x, write_y_top, write_w, write_h = full_x, full_y_top, full_w, full_h
-                target_img = replacement
-            else:
-                write_x, write_y_top, write_w, write_h = base_x, base_y_top, base_w, base_h
-                target_img = replacement if replacement.size == (base_w, base_h) else replacement.resize((base_w, base_h), Image.Resampling.LANCZOS)
+            # 기본은 현재 sprite rect를 기준으로 fullrect(직사각형 메쉬)로 전환합니다.
+            # 단, tightclip 상태에서 full 캔버스 PNG를 넣은 경우 알파 bbox를 이용해
+            # 원래 full rect 좌표를 역산해 범위까지 복원합니다.
+            fullrect_x, fullrect_y, fullrect_w, fullrect_h = base_x, base_y, base_w, base_h
+            write_x, write_y_top, write_w, write_h = base_x, base_y_top, base_w, base_h
+            target_img = replacement if replacement.size == (base_w, base_h) else replacement.resize((base_w, base_h), Image.Resampling.LANCZOS)
+
+            if replacement.size != (base_w, base_h):
+                alpha_bbox = replacement.getchannel("A").getbbox()
+                if alpha_bbox is not None:
+                    bx0, by0, bx1, by1 = alpha_bbox
+                    bbox_w = max(1, bx1 - bx0)
+                    bbox_h = max(1, by1 - by0)
+                    # tightclip rect(=base rect)와 replacement alpha bbox가 맞으면
+                    # full canvas 좌표를 복원할 수 있습니다.
+                    if abs(bbox_w - base_w) <= 1 and abs(bbox_h - base_h) <= 1:
+                        cand_w, cand_h = replacement.size
+                        cand_x = base_x - int(bx0)
+                        cand_y = base_y - int(cand_h - by1)
+                        cand_y_top = texture_image.height - (cand_y + cand_h)
+                        if (
+                            cand_w > 0
+                            and cand_h > 0
+                            and cand_x >= 0
+                            and cand_y_top >= 0
+                            and (cand_x + cand_w) <= texture_image.width
+                            and (cand_y_top + cand_h) <= texture_image.height
+                        ):
+                            fullrect_x, fullrect_y, fullrect_w, fullrect_h = cand_x, cand_y, int(cand_w), int(cand_h)
+                            write_x, write_y_top, write_w, write_h = cand_x, cand_y_top, int(cand_w), int(cand_h)
+                            target_img = replacement
 
             if changed_only:
                 current_crop = texture_image.crop((write_x, write_y_top, write_x + write_w, write_y_top + write_h))
                 expected_raw = convert_settings_raw(raw_now, "fullrect")
-                rect_ok = (rect_now_x, rect_now_y, rect_now_w, rect_now_h) == (full_x, full_y, full_w, full_h)
+                rect_ok = (rect_now_x, rect_now_y, rect_now_w, rect_now_h) == (fullrect_x, fullrect_y, fullrect_w, fullrect_h)
                 mesh_ok = _is_quad_mesh(rd_now)
                 if image_equal(current_crop, target_img) and raw_now == expected_raw and rect_ok and mesh_ok:
                     skipped_same += 1
@@ -1539,7 +1686,7 @@ def replace_sprites_in_assets_file(
             texture_image.paste(target_img, (write_x, write_y_top))
             texture.set_image(texture_image)
             texture.save()
-            before, after = apply_sprite_mode_and_rect(obj, mode="fullrect", tight_rect=(full_x, full_y, full_w, full_h))
+            before, after = apply_sprite_mode_and_rect(obj, mode="fullrect", tight_rect=(fullrect_x, fullrect_y, fullrect_w, fullrect_h))
             update_atlas_settings(sprite, mode="fullrect")
         elif target_mode == "tightmesh":
             if replacement.size == (base_w, base_h):

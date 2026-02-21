@@ -181,22 +181,32 @@ If `Replace_to` is a relative path, it is resolved against the EXE (or script) d
 
 ## UABEA JSON Patch Script (UABEA_sprite_json_edit.exe / UABEA_sprite_json_edit_en.exe)
 
-`UABEA_sprite_json_edit.exe` (Korean) and `UABEA_sprite_json_edit_en.exe` (English) patch UABEA-dumped Sprite JSON for FullRect behavior.
+`UABEA_sprite_json_edit.exe` (Korean) and `UABEA_sprite_json_edit_en.exe` (English) patch UABEA-dumped Sprite JSON by target mode.
 
-What it does:
-- Patch UABEA Sprite JSON for FullRect workflow
-- Update `m_RD.settingsRaw` to FullRect bits
-- Expand `m_RD.textureRect` / `textureRectOffset` based on `m_Rect`
-- Rebuild `m_RD.m_VertexData` / `m_IndexBuffer` / `m_SubMeshes` into a FullRect quad mesh (4 vertices)
+What it does (by mode):
+- `fullrect`
+  - Set `settingsRaw` to FullRect bits
+  - (Default) keep current `textureRect`
+  - Use `--expand-rect` to expand `textureRect` to `m_Rect`
+  - set `textureRectOffset` to `(0,0)`
+  - rebuild quad mesh (4 vertices)
+- `tightclip` (requires `--image`)
+  - set `textureRect` from PNG alpha bounding box
+  - set `textureRectOffset` to `textureRect.xy`
+  - rebuild quad mesh (4 vertices)
+- `tightmesh` (requires `--image`)
+  - set `textureRect` from PNG alpha bounding box
+  - set `textureRectOffset` to `textureRect.xy`
+  - try rebuilding polygon mesh (environment-dependent), otherwise keep existing mesh
 
 Behavior:
-- **With input arguments**: create `<original_name>.fullrect.json` (keep original file)
-- **Without input arguments**: in-place patch all JSON files in current directory (or `--dir`), excluding `.fullrect.json`
+- **With input arguments**: create `<original_name>.<mode>.json` (keep original file)
+- **Without input arguments**: in-place patch JSON files in current directory (or `--dir`), excluding `.fullrect/.tightclip/.tightmesh.json`
 
 CLI options (full list):
 
 - `inputs` (positional, zero or more)
-  - If specified, creates `<name>.fullrect.json` for each input
+  - If specified, creates `<name>.<mode>.json` for each input
   - Default: none
 - `--dir PATH`
   - Target folder for batch mode when no positional inputs are given
@@ -204,9 +214,15 @@ CLI options (full list):
 - `--recursive`
   - Recursively scan subfolders in batch mode (no positional inputs)
   - Default: `False`
-- `--no-expand-rect`
-  - Do not expand `textureRect`/`textureRectOffset` to `m_Rect`
-  - Default: `False` (expand by default)
+- `--mode fullrect|tightclip|tightmesh`
+  - Target mode
+  - Default: `fullrect`
+- `--image PATH`
+  - PNG image used by `tightclip`/`tightmesh`
+  - Optional in `fullrect`
+- `--expand-rect`
+  - For `fullrect` only: expand `textureRect` to `m_Rect`
+  - Default: `False` (no expansion by default)
 
 Examples:
 
@@ -215,17 +231,27 @@ Examples:
 UABEA_sprite_json_edit_en.exe "字 A-sharedassets0.assets.bak_before_sprite_replace-186.json"
 ```
 
-2. Batch in current folder (excluding `.fullrect.json`)
+2. Single input -> create `<name>.tightclip.json` (requires `--image`)
+```bat
+UABEA_sprite_json_edit_en.exe --mode tightclip --image "C:\path\to\字 A.sprite.png" "字 A-sharedassets0.assets.bak_before_sprite_replace-186.json"
+```
+
+3. Single input -> create `<name>.tightmesh.json` (requires `--image`)
+```bat
+UABEA_sprite_json_edit_en.exe --mode tightmesh --image "C:\path\to\字 A.sprite.png" "字 A-sharedassets0.assets.bak_before_sprite_replace-186.json"
+```
+
+4. Batch in current folder (excluding generated mode suffix files)
 ```bat
 UABEA_sprite_json_edit_en.exe
 ```
 
-3. Batch in specific folder
+5. Batch in specific folder
 ```bat
 UABEA_sprite_json_edit_en.exe --dir "C:\path\to\json_folder"
 ```
 
-4. Recursive batch in specific folder
+6. Recursive batch in specific folder
 ```bat
 UABEA_sprite_json_edit_en.exe --dir "C:\path\to\json_folder" --recursive
 ```
@@ -237,8 +263,8 @@ UABEA_sprite_json_edit_en.exe --dir "C:\path\to\json_folder" --recursive
 - In `fullrect` replacement, the tool updates `textureRect/textureRectOffset` to match `m_Rect` together with `settingsRaw`.
 - `tightmesh` writes an alpha-outline polygon mesh into `m_VertexData/m_IndexBuffer/m_SubMeshes`.
   - For better `tightmesh` quality, `opencv-python-headless`, `mapbox-earcut`, and `numpy` are recommended.
-- When `--gamepath` is a game root or `_Data` folder, the tool prioritizes top-level `.assets` files in `_Data`.
-  (Backup copies under subfolders such as `Original`/`backup` are excluded from default scan.)
+- When `--gamepath` is a game root or `_Data` folder, the tool recursively scans the entire `_Data` folder by default.
+  (It includes Unity serialized-file candidates beyond `.assets`, and auto-skips files that fail `UnityPy.load`.)
 - If a Texture2D `.resS` resource is missing, that entry is skipped instead of aborting the entire run.
 
 ## License

@@ -18,6 +18,9 @@ Unity Sprite 추출/교체 도구입니다.
    - `fullrect`: FullRect 강제
    - `tightclip`: 이미지 알파 영역 기준 bbox로 타이트 클리핑
    - `tightmesh`: 이미지 알파 외곽선 기반 폴리곤 메쉬로 타이트 클리핑
+7. 에셋 스캔
+   - 기본적으로 `_Data` 전체 재귀 스캔
+   - `.assets` 외 Unity 직렬화 파일 후보도 대상으로 시도(`UnityPy.load` 실패 파일은 자동 스킵)
 
 ## 실행 파일 준비
 
@@ -60,7 +63,7 @@ unity_sprite_fullrect_replacer.exe [옵션]
 ### 공통
 
 - `--gamepath PATH`
-  - 게임 루트 / `_Data` / 단일 `.assets` 파일 경로
+  - 게임 루트 / `_Data` / 단일 Unity 자산 파일 경로(확장자 무관)
   - 기본값: 없음(미지정 시 실행 중 입력)
 - `--mode fullrect|tightclip|tightmesh`
   - 교체 모드 기본값
@@ -181,22 +184,32 @@ unity_sprite_fullrect_replacer.exe --gamepath "D:\Games\Game" --replace-dir ".\s
 
 ## UABEA JSON 보정 스크립트 (UABEA_sprite_json_edit.exe / UABEA_sprite_json_edit_en.exe)
 
-`UABEA_sprite_json_edit.exe`(한국어), `UABEA_sprite_json_edit_en.exe`(영어)는 UABEA로 덤프한 Sprite JSON을 FullRect 기준으로 보정합니다.
+`UABEA_sprite_json_edit.exe`(한국어), `UABEA_sprite_json_edit_en.exe`(영어)는 UABEA로 덤프한 Sprite JSON을 모드별로 보정합니다.
 
-역할:
-- UABEA로 덤프한 Sprite JSON을 FullRect 기준으로 보정
-- `m_RD.settingsRaw`를 FullRect 비트로 변경
-- `m_RD.textureRect` / `textureRectOffset`를 `m_Rect` 기준으로 확장
-- `m_RD.m_VertexData` / `m_IndexBuffer` / `m_SubMeshes`를 FullRect용 쿼드 메쉬(4정점)로 보정
+역할(모드별):
+- `fullrect`
+  - `settingsRaw`를 FullRect 비트로 변경
+  - (기본) 현재 `textureRect` 유지
+  - `--expand-rect` 사용 시 `textureRect`를 `m_Rect`로 확장
+  - `textureRectOffset`을 `(0,0)`으로 보정
+  - 쿼드 메쉬(4정점)로 보정
+- `tightclip` (`--image` 필요)
+  - PNG 알파 bbox 기준으로 `textureRect`를 타이트하게 재설정
+  - `textureRectOffset`을 `textureRect.xy`로 보정
+  - 쿼드 메쉬(4정점)로 보정
+- `tightmesh` (`--image` 필요)
+  - PNG 알파 기준으로 `textureRect`를 타이트하게 재설정
+  - `textureRectOffset`을 `textureRect.xy`로 보정
+  - 가능하면 폴리곤 메쉬 재생성(환경 의존), 실패 시 기존 메쉬 유지
 
 동작 규칙:
-- **인자 있음**: `<원본이름>.fullrect.json` 파일 생성 (원본 유지)
-- **인자 없음**: 현재 폴더(또는 `--dir`)의 JSON 중 `.fullrect.json` 제외 파일을 직접 수정
+- **인자 있음**: `<원본이름>.<mode>.json` 파일 생성 (원본 유지)
+- **인자 없음**: 현재 폴더(또는 `--dir`)의 JSON 중 `.fullrect/.tightclip/.tightmesh.json` 제외 파일을 직접 수정
 
 CLI 옵션(전체):
 
 - `inputs` (위치 인자, 0개 이상)
-  - 지정 시 각 입력 JSON으로부터 `<이름>.fullrect.json` 생성
+  - 지정 시 각 입력 JSON으로부터 `<이름>.<mode>.json` 생성
   - 기본값: 없음
 - `--dir PATH`
   - 인자 없을 때 배치 대상 폴더
@@ -204,9 +217,15 @@ CLI 옵션(전체):
 - `--recursive`
   - 인자 없을 때 하위 폴더까지 재귀 탐색
   - 기본값: `False`
-- `--no-expand-rect`
-  - `textureRect`/`textureRectOffset`를 `m_Rect`로 확장하지 않음
-  - 기본값: `False` (즉, 기본은 확장)
+- `--mode fullrect|tightclip|tightmesh`
+  - 목표 모드
+  - 기본값: `fullrect`
+- `--image PATH`
+  - `tightclip`/`tightmesh`에서 사용할 PNG 이미지
+  - `fullrect`에서는 선택 사항
+- `--expand-rect`
+  - `fullrect`에서 `textureRect`를 `m_Rect`로 확장
+  - 기본값: `False` (즉, 기본은 확장 안 함)
 
 예시:
 
@@ -215,17 +234,27 @@ CLI 옵션(전체):
 UABEA_sprite_json_edit.exe "字 A-sharedassets0.assets.bak_before_sprite_replace-186.json"
 ```
 
-2. 현재 폴더 일괄 수정 (`.fullrect.json` 제외)
+2. 단일 파일 입력 -> `<이름>.tightclip.json` 생성 (`--image` 필수)
+```bat
+UABEA_sprite_json_edit.exe --mode tightclip --image "C:\path\to\字 A.sprite.png" "字 A-sharedassets0.assets.bak_before_sprite_replace-186.json"
+```
+
+3. 단일 파일 입력 -> `<이름>.tightmesh.json` 생성 (`--image` 필수)
+```bat
+UABEA_sprite_json_edit.exe --mode tightmesh --image "C:\path\to\字 A.sprite.png" "字 A-sharedassets0.assets.bak_before_sprite_replace-186.json"
+```
+
+4. 현재 폴더 일괄 수정 (보정 JSON suffix 제외)
 ```bat
 UABEA_sprite_json_edit.exe
 ```
 
-3. 특정 폴더 일괄 수정
+5. 특정 폴더 일괄 수정
 ```bat
 UABEA_sprite_json_edit.exe --dir "C:\path\to\json_folder"
 ```
 
-4. 특정 폴더 재귀 일괄 수정
+6. 특정 폴더 재귀 일괄 수정
 ```bat
 UABEA_sprite_json_edit.exe --dir "C:\path\to\json_folder" --recursive
 ```
@@ -233,12 +262,13 @@ UABEA_sprite_json_edit.exe --dir "C:\path\to\json_folder" --recursive
 ## 참고
 
 - `Managed` 폴더는 Sprite 수정 작업에 필요하지 않습니다.
-- 입력 경로는 게임 루트 / `_Data` / 단일 `.assets` 파일 모두 지원합니다.
-- `fullrect` 교체 시 `settingsRaw`와 함께 `textureRect/textureRectOffset`도 `m_Rect` 기준으로 맞춰 적용합니다.
+- 입력 경로는 게임 루트 / `_Data` / 단일 Unity 자산 파일(확장자 무관)을 지원합니다.
+- `fullrect` 교체 시 `settingsRaw`/메쉬/`textureRectOffset`은 FullRect 규칙으로 보정됩니다.
+  (`textureRect`는 기본적으로 JSON 값 유지, 필요 시 `tightclip -> fullrect` 복원 흐름에서 전체 캔버스 기준으로 자동 복원)
 - `tightmesh`는 알파 외곽선으로 생성한 폴리곤 메쉬를 `m_VertexData/m_IndexBuffer/m_SubMeshes`에 반영합니다.
   - `tightmesh` 품질 향상을 위해 `opencv-python-headless`, `mapbox-earcut`, `numpy`를 권장합니다.
-- `--gamepath`에 게임 루트 또는 `_Data`를 줄 때는 `_Data` 최상위 `.assets`를 우선 처리합니다.
-  (하위 폴더의 `Original`/`backup` 복사본 `.assets`는 기본 스캔에서 제외됩니다.)
+- `--gamepath`에 게임 루트 또는 `_Data`를 줄 때 `_Data` 전체를 기본 재귀 스캔합니다.
+  (`.assets`뿐 아니라 Unity 직렬화 파일 후보를 함께 대상으로 잡고, `UnityPy.load` 실패 파일은 자동 스킵합니다.)
 - Texture2D 로드 중 `.resS`가 누락된 항목은 프로그램 전체 중단 대신 해당 항목만 스킵합니다.
 
 ## 라이선스
