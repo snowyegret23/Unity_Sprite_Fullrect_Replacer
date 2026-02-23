@@ -157,6 +157,34 @@ def sanitize_filename(name: str) -> str:
     return sanitized or "unnamed"
 
 
+def normalize_user_path_input(raw: str) -> str:
+    value = raw.strip()
+    if not value:
+        return ""
+
+    while True:
+        changed = False
+
+        while value and (value.startswith('"') or value.endswith('"')):
+            if value.startswith('"'):
+                value = value[1:].strip()
+                changed = True
+            if value.endswith('"'):
+                value = value[:-1].strip()
+                changed = True
+
+        while value and (value.startswith("'") or value.endswith("'")):
+            if value.startswith("'"):
+                value = value[1:].strip()
+                changed = True
+            if value.endswith("'"):
+                value = value[:-1].strip()
+                changed = True
+
+        if not changed:
+            return value
+
+
 def split_csv_args(values: list[str] | None) -> list[str]:
     if not values:
         return []
@@ -204,12 +232,41 @@ def replacement_token_from_filename(file_name: str) -> str:
     return token.strip()
 
 
+def parse_extracted_sprite_png_name(file_name: str) -> tuple[str, int, str] | None:
+    # format from --extract-all:
+    # <sanitized_file_name>__<PathID>__<sanitized_sprite_name>.sprite.png
+    lower = file_name.lower()
+    if not lower.endswith(".sprite.png"):
+        return None
+    core = file_name[: -len(".sprite.png")]
+    parts = core.split("__", 2)
+    if len(parts) != 3:
+        return None
+    file_tag, path_id_raw, sprite_tag = parts
+    file_tag = file_tag.strip()
+    sprite_tag = sprite_tag.strip()
+    if not file_tag or not sprite_tag:
+        return None
+    try:
+        path_id = int(path_id_raw.strip(), 10)
+    except Exception:
+        return None
+    return file_tag, path_id, sprite_tag
+
+
 def build_filename_replacements(
     replace_dir: Path,
     *,
     recursive: bool,
     default_mode: Mode,
 ) -> dict[str, JsonDict]:
+    def add_key(mapping: dict[str, JsonDict], key: str, entry: JsonDict, png_name: str) -> None:
+        prev = mapping.get(key)
+        if prev is not None and str(prev.get("replace_path")) != str(entry.get("replace_path")):
+            print(f"[경고] 파일명 키 충돌로 이후 파일을 무시합니다: key={key} file={png_name}")
+            return
+        mapping[key] = entry
+
     pattern = "**/*.png" if recursive else "*.png"
     replacements: dict[str, JsonDict] = {}
     for png_path in sorted(replace_dir.glob(pattern)):
@@ -224,10 +281,26 @@ def build_filename_replacements(
             "mode": default_mode,
             "name": token,
         }
-        if key in replacements:
-            print(f"[경고] 파일명 중복 매칭으로 이후 파일을 무시합니다: {png_path.name}")
-            continue
-        replacements[key] = normalized
+        # legacy name-token match
+        add_key(replacements, key, normalized, png_path.name)
+        add_key(replacements, f"name:{key}", normalized, png_path.name)
+
+        parsed = parse_extracted_sprite_png_name(png_path.name)
+        if parsed is not None:
+            file_tag, path_id, sprite_tag = parsed
+            file_tag_fold = file_tag.casefold()
+            file_tag_safe_fold = sanitize_filename(file_tag).casefold()
+            sprite_tag_fold = sprite_tag.casefold()
+            sprite_tag_safe_fold = sanitize_filename(sprite_tag).casefold()
+
+            # Prefer extracted filename pattern when available.
+            add_key(replacements, f"idfile:{file_tag_fold}:{path_id}", normalized, png_path.name)
+            add_key(replacements, f"idfile:{file_tag_safe_fold}:{path_id}", normalized, png_path.name)
+            add_key(replacements, f"id:{path_id}", normalized, png_path.name)
+            add_key(replacements, f"idname:{path_id}:{sprite_tag_fold}", normalized, png_path.name)
+            add_key(replacements, f"idname:{path_id}:{sprite_tag_safe_fold}", normalized, png_path.name)
+            add_key(replacements, f"name:{sprite_tag_fold}", normalized, png_path.name)
+            add_key(replacements, f"name:{sprite_tag_safe_fold}", normalized, png_path.name)
     return replacements
 
 
@@ -1554,8 +1627,23 @@ def replace_sprites_in_assets_file(
         if entry is None:
             entry = by_name.get((file_lower, assets_name, sprite_name))
         if entry is None and by_filename is not None:
+            # 1) extracted filename pattern match by file/pathid
+            file_tag = sanitize_filename(assets_file.name).casefold()
+            id_keys = (
+                f"idfile:{assets_file.name.casefold()}:{path_id}",
+                f"idfile:{file_tag}:{path_id}",
+                f"idname:{path_id}:{sanitize_filename(sprite_name).casefold()}",
+                f"idname:{path_id}:{sprite_name.casefold()}",
+                f"id:{path_id}",
+            )
+            for k in id_keys:
+                entry = by_filename.get(k)
+                if entry is not None:
+                    break
+        if entry is None and by_filename is not None:
+            # 2) fallback by sprite name tokens
             for token in (sprite_name.casefold(), sanitize_filename(sprite_name).casefold()):
-                entry = by_filename.get(token)
+                entry = by_filename.get(f"name:{token}") or by_filename.get(token)
                 if entry is not None:
                     break
         if entry is None:
@@ -1904,6 +1992,18 @@ def main_cli(lang: Language = "ko") -> None:
     parser.add_argument("--verbose", action="store_true", help="로그를 verbose.txt로 저장")
     args = parser.parse_args()
 
+    # normalize path-like args to tolerate pasted quoted paths
+    if args.gamepath:
+        args.gamepath = normalize_user_path_input(args.gamepath)
+    if args.list:
+        args.list = normalize_user_path_input(args.list)
+    if args.replace_dir:
+        args.replace_dir = normalize_user_path_input(args.replace_dir)
+    if args.output_dir:
+        args.output_dir = normalize_user_path_input(args.output_dir)
+    if args.json_out:
+        args.json_out = normalize_user_path_input(args.json_out)
+
     warn_unitypy_version()
 
     verbose_file: io.TextIOBase | None = None
@@ -1919,15 +2019,25 @@ def main_cli(lang: Language = "ko") -> None:
         print(f"[verbose] 로그 저장: {verbose_path}")
 
     input_path = args.gamepath
-    if not input_path:
-        input_path = input("게임 경로(_Data/루트/.assets)를 입력하세요: ").strip()
-    if not input_path:
-        exit_with_error("경로 입력이 필요합니다.")
+    interactive_gamepath = not bool(input_path)
+    while True:
+        if not input_path:
+            input_path = normalize_user_path_input(input("게임 경로(_Data/루트/.assets)를 입력하세요: "))
+        if not input_path:
+            if interactive_gamepath:
+                print("[오류] 경로 입력이 필요합니다.")
+                continue
+            exit_with_error("경로 입력이 필요합니다.")
 
-    try:
-        game_path, data_path, assets_files = resolve_input_path(input_path)
-    except FileNotFoundError as e:
-        exit_with_error(str(e))
+        try:
+            game_path, data_path, assets_files = resolve_input_path(input_path)
+            break
+        except FileNotFoundError as e:
+            if interactive_gamepath:
+                print(f"[오류] {e}")
+                input_path = ""
+                continue
+            exit_with_error(str(e))
 
     print(f"[정보] Game Path: {game_path}")
     print(f"[정보] Data Path: {data_path}")
@@ -1943,6 +2053,8 @@ def main_cli(lang: Language = "ko") -> None:
     mode_extract = args.extract_all
     mode_replace_json = bool(args.list)
     mode_replace_dir = bool(args.replace_dir)
+    interactive_json_path_prompt = False
+    interactive_replace_dir_prompt = False
     if mode_replace_json and mode_replace_dir:
         exit_with_error("--list 와 --replace-dir 는 동시에 사용할 수 없습니다.")
 
@@ -1957,16 +2069,34 @@ def main_cli(lang: Language = "ko") -> None:
             mode_parse = True
         elif choice == "2":
             mode_replace_json = True
-            args.list = input("JSON 파일 경로를 입력하세요: ").strip()
-            if not args.list:
-                exit_with_error("JSON 파일 경로가 필요합니다.")
+            interactive_json_path_prompt = True
+            while True:
+                args.list = normalize_user_path_input(input("JSON 파일 경로를 입력하세요: "))
+                if not args.list:
+                    print("[오류] JSON 파일 경로가 필요합니다.")
+                    continue
+                json_check = Path(args.list).expanduser().resolve()
+                if not json_check.exists() or not json_check.is_file():
+                    print(f"[오류] JSON 파일을 찾을 수 없습니다: {json_check}")
+                    continue
+                args.list = str(json_check)
+                break
         elif choice == "3":
             mode_extract = True
         else:
             mode_replace_dir = True
-            args.replace_dir = input("교체 PNG 폴더 경로를 입력하세요: ").strip()
-            if not args.replace_dir:
-                exit_with_error("교체 폴더 경로가 필요합니다.")
+            interactive_replace_dir_prompt = True
+            while True:
+                args.replace_dir = normalize_user_path_input(input("교체 PNG 폴더 경로를 입력하세요: "))
+                if not args.replace_dir:
+                    print("[오류] 교체 폴더 경로가 필요합니다.")
+                    continue
+                dir_check = Path(args.replace_dir).expanduser().resolve()
+                if not dir_check.exists() or not dir_check.is_dir():
+                    print(f"[오류] 교체 폴더를 찾을 수 없습니다: {dir_check}")
+                    continue
+                args.replace_dir = str(dir_check)
+                break
 
     script_dir = get_script_dir()
     game_tag = sanitize_filename(game_path.name if game_path.name else "unity_game")
@@ -2001,9 +2131,28 @@ def main_cli(lang: Language = "ko") -> None:
 
     if mode_replace_json:
         if not args.list:
-            exit_with_error("--list JSON_FILE 이 필요합니다.")
-        json_path = Path(args.list).expanduser().resolve()
-        if not json_path.exists():
+            if not interactive_json_path_prompt:
+                exit_with_error("--list JSON_FILE 이 필요합니다.")
+            while True:
+                args.list = normalize_user_path_input(input("JSON 파일 경로를 입력하세요: "))
+                if not args.list:
+                    print("[오류] JSON 파일 경로가 필요합니다.")
+                    continue
+                json_try = Path(args.list).expanduser().resolve()
+                if not json_try.exists() or not json_try.is_file():
+                    print(f"[오류] JSON 파일을 찾을 수 없습니다: {json_try}")
+                    continue
+                args.list = str(json_try)
+                break
+        json_path = Path(normalize_user_path_input(args.list)).expanduser().resolve()
+        while (not json_path.exists() or not json_path.is_file()) and interactive_json_path_prompt:
+            print(f"[오류] JSON 파일을 찾을 수 없습니다: {json_path}")
+            args.list = normalize_user_path_input(input("JSON 파일 경로를 다시 입력하세요: "))
+            if not args.list:
+                print("[오류] JSON 파일 경로가 필요합니다.")
+                continue
+            json_path = Path(args.list).expanduser().resolve()
+        if not json_path.exists() or not json_path.is_file():
             exit_with_error(f"JSON 파일을 찾을 수 없습니다: {json_path}")
         replaced, missing, same = replace_from_json(
             assets_files,
@@ -2016,8 +2165,29 @@ def main_cli(lang: Language = "ko") -> None:
 
     if mode_replace_dir:
         if not args.replace_dir:
-            exit_with_error("--replace-dir DIR 이 필요합니다.")
-        replace_dir = Path(args.replace_dir).expanduser().resolve()
+            if not interactive_replace_dir_prompt:
+                exit_with_error("--replace-dir DIR 이 필요합니다.")
+            while True:
+                args.replace_dir = normalize_user_path_input(input("교체 PNG 폴더 경로를 입력하세요: "))
+                if not args.replace_dir:
+                    print("[오류] 교체 폴더 경로가 필요합니다.")
+                    continue
+                replace_try = Path(args.replace_dir).expanduser().resolve()
+                if not replace_try.exists() or not replace_try.is_dir():
+                    print(f"[오류] 교체 폴더를 찾을 수 없습니다: {replace_try}")
+                    continue
+                args.replace_dir = str(replace_try)
+                break
+        replace_dir = Path(normalize_user_path_input(args.replace_dir)).expanduser().resolve()
+        while (not replace_dir.exists() or not replace_dir.is_dir()) and interactive_replace_dir_prompt:
+            print(f"[오류] 교체 폴더를 찾을 수 없습니다: {replace_dir}")
+            args.replace_dir = normalize_user_path_input(input("교체 PNG 폴더 경로를 다시 입력하세요: "))
+            if not args.replace_dir:
+                print("[오류] 교체 폴더 경로가 필요합니다.")
+                continue
+            replace_dir = Path(args.replace_dir).expanduser().resolve()
+        if not replace_dir.exists() or not replace_dir.is_dir():
+            exit_with_error(f"교체 폴더를 찾을 수 없습니다: {replace_dir}")
         replaced, missing, same = replace_from_dir(
             assets_files,
             replace_dir=replace_dir,
