@@ -13,6 +13,7 @@ from typing import Any, Literal, NoReturn, cast
 
 import UnityPy
 from PIL import Image, ImageChops, ImageFilter
+from UnityPy.export import SpriteHelper
 
 try:
     import cv2  # type: ignore
@@ -149,6 +150,120 @@ def resolve_input_path(input_path: str) -> tuple[Path, Path, list[Path]]:
     if not assets_files:
         raise FileNotFoundError(f"처리 가능한 에셋 파일을 찾을 수 없습니다: {data_path}")
     return game_path, data_path, assets_files
+
+
+def is_unitypy_short_read_error(exc: Exception) -> bool:
+    if not isinstance(exc, ValueError):
+        return False
+    msg = str(exc)
+    return msg.startswith("Expected to read ") and " but only read " in msg
+
+
+def read_object_tolerant(obj_reader: Any) -> Any:
+    try:
+        return obj_reader.read()
+    except Exception as exc:
+        if is_unitypy_short_read_error(exc):
+            return obj_reader.read(check_read=False)
+        raise
+
+
+def read_typetree_tolerant(obj_reader: Any) -> dict[str, Any]:
+    try:
+        return cast(dict[str, Any], obj_reader.read_typetree())
+    except Exception as exc:
+        if is_unitypy_short_read_error(exc):
+            return cast(dict[str, Any], obj_reader.read_typetree(check_read=False))
+        raise
+
+
+def parse_object_tolerant(obj_reader: Any) -> Any:
+    try:
+        return obj_reader.parse_as_object()
+    except Exception as exc:
+        if is_unitypy_short_read_error(exc):
+            return obj_reader.parse_as_object(check_read=False)
+        raise
+
+
+def deref_parse_as_object_tolerant(pptr: Any, assetsfile: Any = None) -> Any:
+    return parse_object_tolerant(pptr.deref(assetsfile))
+
+
+def get_sprite_image_tolerant(sprite: Any) -> Image.Image:
+    atlas = None
+    if sprite.m_SpriteAtlas:
+        atlas = deref_parse_as_object_tolerant(sprite.m_SpriteAtlas)
+    elif sprite.m_AtlasTags:
+        assert sprite.assets_file, "Sprite assets file is not set!"
+        for obj in sprite.assets_file.objects.values():
+            if obj.type == SpriteHelper.ClassIDType.SpriteAtlas:
+                name = obj.peek_name()
+                if name == sprite.m_AtlasTags[0]:
+                    atlas = parse_object_tolerant(obj)
+                    break
+                atlas = None
+
+    if atlas:
+        sprite_atlas_data = next(value for key, value in atlas.m_RenderDataMap if key == sprite.m_RenderDataKey)
+        assert isinstance(sprite_atlas_data, SpriteHelper.SpriteAtlasData), "SpriteAtlasData not found!"
+    else:
+        sprite_atlas_data = sprite.m_RD
+
+    m_texture2d = sprite_atlas_data.texture
+    alpha_texture = sprite_atlas_data.alphaTexture
+    texture_rect = sprite_atlas_data.textureRect
+    settings_raw = sprite_atlas_data.settingsRaw
+
+    assert sprite.assets_file, "Sprite assets file is not set!"
+    cache = cast(dict[Any, Any], sprite.assets_file._cache)
+
+    if alpha_texture:
+        cache_id = (m_texture2d.path_id, alpha_texture.path_id)
+        if cache_id not in cache:
+            original_image = SpriteHelper.get_image_from_texture2d(deref_parse_as_object_tolerant(m_texture2d), False)
+            alpha_image = SpriteHelper.get_image_from_texture2d(deref_parse_as_object_tolerant(alpha_texture), False)
+            cache[cache_id] = Image.merge("RGBA", (*original_image.split()[:3], alpha_image.split()[0]))
+    else:
+        cache_id = m_texture2d.path_id
+        if cache_id not in cache:
+            cache[cache_id] = SpriteHelper.get_image_from_texture2d(deref_parse_as_object_tolerant(m_texture2d), False)
+
+    original_image = cache[cache_id]
+    sprite_image = original_image.crop(
+        (
+            texture_rect.x,
+            texture_rect.y,
+            texture_rect.x + texture_rect.width,
+            texture_rect.y + texture_rect.height,
+        )
+    )
+
+    settings = SpriteHelper.SpriteSettings(settings_raw)
+    if settings.packed == 1:
+        rotation = settings.packingRotation
+        if rotation == SpriteHelper.SpritePackingRotation.kSPRFlipHorizontal:
+            sprite_image = sprite_image.transpose(SpriteHelper.Transpose.FLIP_LEFT_RIGHT)
+        elif rotation == SpriteHelper.SpritePackingRotation.kSPRFlipVertical:
+            sprite_image = sprite_image.transpose(SpriteHelper.Transpose.FLIP_TOP_BOTTOM)
+        elif rotation == SpriteHelper.SpritePackingRotation.kSPRRotate180:
+            sprite_image = sprite_image.transpose(SpriteHelper.Transpose.ROTATE_180)
+        elif rotation == SpriteHelper.SpritePackingRotation.kSPRRotate90:
+            sprite_image = sprite_image.transpose(SpriteHelper.Transpose.ROTATE_270)
+
+    if settings.packingMode == SpriteHelper.SpritePackingMode.kSPMTight:
+        assert sprite.object_reader, "Sprite object reader is not set!"
+        mesh = SpriteHelper.MeshHandler(sprite.m_RD, sprite.object_reader.version)
+        mesh.process()
+        if mesh.m_UV0 and any(u or v for u, v in mesh.m_UV0):
+            try:
+                sprite_image = SpriteHelper.render_sprite_mesh(sprite, mesh, original_image)
+            except Exception:
+                sprite_image = SpriteHelper.mask_sprite(sprite, mesh, sprite_image)
+        else:
+            sprite_image = SpriteHelper.mask_sprite(sprite, mesh, sprite_image)
+
+    return sprite_image.transpose(SpriteHelper.Transpose.FLIP_TOP_BOTTOM)
 
 
 def sanitize_filename(name: str) -> str:
@@ -414,7 +529,7 @@ def load_sprite_records(
         for obj in env.objects:
             if obj.type.name != "Sprite":
                 continue
-            sprite = obj.read()
+            sprite = read_object_tolerant(obj)
             sprite_name = str(getattr(sprite, "m_Name", "") or "")
             path_id = int(obj.path_id)
             if not sprite_matches_filters(file_name, path_id, sprite_name, id_filters, names, names_fold, contains_tokens):
@@ -489,6 +604,7 @@ def extract_sprites(
     output_dir.mkdir(parents=True, exist_ok=True)
     records: dict[str, JsonDict] = {}
     exported = 0
+    skipped = 0
 
     for assets_file in assets_files:
         try:
@@ -502,37 +618,45 @@ def extract_sprites(
         for obj in env.objects:
             if obj.type.name != "Sprite":
                 continue
-            sprite = obj.read()
-            sprite_name = str(getattr(sprite, "m_Name", "") or "")
             path_id = int(obj.path_id)
-            if not sprite_matches_filters(file_name, path_id, sprite_name, id_filters, names, names_fold, contains_tokens):
+            sprite_name = ""
+            try:
+                sprite = read_object_tolerant(obj)
+                sprite_name = str(getattr(sprite, "m_Name", "") or "")
+                if not sprite_matches_filters(file_name, path_id, sprite_name, id_filters, names, names_fold, contains_tokens):
+                    continue
+
+                image = get_sprite_image_tolerant(sprite).convert("RGBA")
+                rect = getattr(getattr(sprite, "m_RD", None), "textureRect", None)
+                rect_x = int(round(getattr(rect, "x", 0.0)))
+                rect_y = int(round(getattr(rect, "y", 0.0)))
+                rect_w = int(round(getattr(rect, "width", 0.0)))
+                rect_h = int(round(getattr(rect, "height", 0.0)))
+                png_name = f"{sanitize_filename(file_name)}__{path_id}__{sanitize_filename(sprite_name)}.sprite.png"
+                png_path = output_dir / png_name
+                image.save(png_path)
+
+                key = f"{file_name}|{obj.assets_file.name}|{sprite_name}|Sprite|{path_id}"
+                records[key] = make_sprite_record(
+                    file_name=file_name,
+                    assets_name=obj.assets_file.name,
+                    path_id=path_id,
+                    sprite_name=sprite_name,
+                    texture_rect_x=rect_x,
+                    texture_rect_y=rect_y,
+                    texture_rect_width=rect_w,
+                    texture_rect_height=rect_h,
+                    mode=default_mode,
+                    replace_to=str(png_path),
+                )
+                exported += 1
+                file_count += 1
+            except Exception as e:
+                skipped += 1
+                if not sprite_name:
+                    sprite_name = str(obj.peek_name() or "")
+                print(f"[스킵] Sprite 추출 실패: {assets_file.name} | PathID={path_id} | Name={sprite_name} ({e})")
                 continue
-
-            image = sprite.image.convert("RGBA")
-            rect = getattr(getattr(sprite, "m_RD", None), "textureRect", None)
-            rect_x = int(round(getattr(rect, "x", 0.0)))
-            rect_y = int(round(getattr(rect, "y", 0.0)))
-            rect_w = int(round(getattr(rect, "width", 0.0)))
-            rect_h = int(round(getattr(rect, "height", 0.0)))
-            png_name = f"{sanitize_filename(file_name)}__{path_id}__{sanitize_filename(sprite_name)}.sprite.png"
-            png_path = output_dir / png_name
-            image.save(png_path)
-
-            key = f"{file_name}|{obj.assets_file.name}|{sprite_name}|Sprite|{path_id}"
-            records[key] = make_sprite_record(
-                file_name=file_name,
-                assets_name=obj.assets_file.name,
-                path_id=path_id,
-                sprite_name=sprite_name,
-                texture_rect_x=rect_x,
-                texture_rect_y=rect_y,
-                texture_rect_width=rect_w,
-                texture_rect_height=rect_h,
-                mode=default_mode,
-                replace_to=str(png_path),
-            )
-            exported += 1
-            file_count += 1
 
         if file_count:
             print(f"[정보] {assets_file.name}: Sprite {file_count}개 추출")
@@ -541,8 +665,240 @@ def extract_sprites(
         write_json(json_out, records)
         print(f"[완료] 추출 JSON 저장: {json_out}")
 
+    if skipped:
+        print(f"[정보] Sprite 추출 스킵 수: {skipped}")
     print(f"[완료] Sprite PNG 추출 수: {exported}")
     return exported
+
+
+# ---------------------------------------------------------------------------
+# UnityCN (China Unity) trailing bytes support
+# ---------------------------------------------------------------------------
+_trailing_bytes_store: dict[int, bytes] = {}
+
+
+def _capture_trailing_bytes(obj: Any) -> bytes:
+    """TypeTree 파싱 후 읽히지 않은 trailing bytes를 캡처합니다."""
+    pos = obj.reader.Position
+    end = obj.byte_start + obj.byte_size
+    if pos < end:
+        remaining = obj.reader.read_bytes(end - pos)
+        obj.reader.Position = pos
+        return remaining
+    return b""
+
+
+def _safe_parse_as_object(obj: Any, **kwargs: Any) -> Any:
+    """parse_as_object()를 check_read=True로 먼저 시도하고,
+    바이트 크기 불일치(중국판 Unity 등)로 실패하면 check_read=False로 재시도하고
+    trailing bytes를 별도 저장소에 보존합니다.
+    """
+    obj_id = id(obj)
+    try:
+        result = obj.parse_as_object(check_read=True, **kwargs)
+        _trailing_bytes_store.pop(obj_id, None)
+        return result
+    except ValueError as e:
+        if "Expected to read" in str(e) and "bytes" in str(e):
+            result = obj.parse_as_object(check_read=False, **kwargs)
+            trailing = _capture_trailing_bytes(obj)
+            if trailing:
+                _trailing_bytes_store[obj_id] = trailing
+            else:
+                _trailing_bytes_store.pop(obj_id, None)
+            return result
+        raise
+
+
+def _safe_parse_as_dict(obj: Any, **kwargs: Any) -> dict[str, Any]:
+    """parse_as_dict()를 check_read=True로 먼저 시도하고,
+    바이트 크기 불일치로 실패하면 check_read=False로 재시도하고
+    trailing bytes를 별도 저장소에 보존합니다.
+    """
+    obj_id = id(obj)
+    try:
+        result = obj.parse_as_dict(check_read=True, **kwargs)
+        _trailing_bytes_store.pop(obj_id, None)
+        return result
+    except ValueError as e:
+        if "Expected to read" in str(e) and "bytes" in str(e):
+            result = obj.parse_as_dict(check_read=False, **kwargs)
+            trailing = _capture_trailing_bytes(obj)
+            if trailing:
+                _trailing_bytes_store[obj_id] = trailing
+            else:
+                _trailing_bytes_store.pop(obj_id, None)
+            return result
+        raise
+
+
+def _safe_save(obj: Any, parse_dict: Any) -> None:
+    """save() 후 trailing bytes가 있으면 raw data에 append합니다."""
+    parse_dict.save()
+    obj_id = id(obj)
+    trailing = _trailing_bytes_store.pop(obj_id, b"")
+    if trailing:
+        current_data = obj.get_raw_data()
+        obj.set_raw_data(current_data + trailing)
+
+
+def _has_trailing_bytes(obj: Any) -> bool:
+    """이 오브젝트에 TypeTree로 읽히지 않는 trailing bytes가 있는지 확인합니다."""
+    return id(obj) in _trailing_bytes_store
+
+
+def _detect_typetree_size_mismatch(obj: Any) -> bool:
+    """TypeTree로 읽은 후 다시 쓰면 원본보다 작아지는지 감지합니다.
+    중국판 Unity 등에서 TypeTree에 없는 추가 필드가 있으면 True를 반환합니다.
+    """
+    try:
+        from UnityPy.helpers.TypeTreeHelper import write_typetree
+        from UnityPy.streams import EndianBinaryWriter
+        original_raw = obj.get_raw_data()
+        d = obj.read_typetree(check_read=False)
+        node = obj._get_typetree_node()
+        w = EndianBinaryWriter(endian=obj.reader.endian)
+        write_typetree(d, node, w, obj.assets_file)
+        rewritten_size = w.Length
+        w.dispose()
+        return rewritten_size < len(original_raw)
+    except Exception:
+        return False
+
+
+def _binary_patch_texture2d(
+    obj: Any,
+    *,
+    image_data: bytes,
+    width: int,
+    height: int,
+) -> bool:
+    """Texture2D를 TypeTree 재직렬화 없이 바이너리 패치합니다.
+    중국판 Unity 등에서 TypeTree가 커버하지 못하는 extra bytes가 있을 때 사용합니다.
+    """
+    import struct as _struct
+
+    original_raw = obj.get_raw_data()
+    if len(original_raw) < 48:
+        return False
+
+    # 원본 raw에서 스트림 경로 문자열을 찾아 필드 위치를 역추적합니다.
+    stream_path_marker = None
+    for marker in [b".resS", b".resource"]:
+        idx = original_raw.find(marker)
+        if idx >= 0:
+            str_start = idx
+            while str_start > 0 and original_raw[str_start - 1:str_start] not in (b"\x00",):
+                str_start -= 1
+                if idx - str_start > 200:
+                    break
+            path_len_pos = str_start - 4
+            if path_len_pos < 0:
+                continue
+            try:
+                path_len = _struct.unpack_from("<i", original_raw, path_len_pos)[0]
+                if 0 < path_len < 256 and path_len_pos + 4 + path_len <= len(original_raw):
+                    stream_path_marker = (path_len_pos, path_len, str_start)
+                    break
+            except Exception:
+                continue
+
+    # TypeTree로 파싱하여 image data 위치와 trailing bytes를 정확히 파악합니다.
+    try:
+        d_temp = obj.read_typetree(check_read=False)
+        orig_img_data = d_temp.get("image data", b"")
+        orig_img_len = len(orig_img_data) if isinstance(orig_img_data, (bytes, bytearray, memoryview)) else 0
+    except Exception:
+        return False
+
+    if stream_path_marker is not None:
+        path_len_pos, path_len, path_str_start = stream_path_marker
+        stream_size_pos = path_len_pos - 4
+        stream_offset_pos = stream_size_pos - 8
+        image_data_size_pos = stream_offset_pos - 4
+        orig_stream_end = path_str_start + path_len
+        orig_stream_end += (4 - orig_stream_end % 4) % 4
+    else:
+        obj.reset()
+        pos0 = obj.reader.Position
+        obj.read_typetree(check_read=False)
+        pos1 = obj.reader.Position
+        typetree_bytes = pos1 - pos0
+
+        trailing_size = len(original_raw) - typetree_bytes
+        empty_stream_data_size = 16
+        img_block_size = 4 + orig_img_len
+        img_block_padded = img_block_size + (4 - img_block_size % 4) % 4
+
+        image_data_size_pos = typetree_bytes - trailing_size - empty_stream_data_size - img_block_padded
+        if image_data_size_pos < 0:
+            image_data_size_pos = len(original_raw) - trailing_size - empty_stream_data_size - img_block_padded
+        orig_stream_end = len(original_raw) - trailing_size
+
+    if image_data_size_pos < 0 or image_data_size_pos >= len(original_raw):
+        return False
+
+    # TypeTree 파싱으로 정확한 필드 오프셋을 구합니다.
+    from UnityPy.helpers.TypeTreeHelper import TypeTreeConfig as _TTC, read_value as _rv
+    from UnityPy.streams import EndianBinaryReader as _EBR
+    field_offsets: dict[str, int] = {}
+    _tmp_reader = None
+    try:
+        _tmp_reader = _EBR(original_raw, endian=obj.reader.endian)
+        _tmp_config = _TTC(True, obj.assets_file, False)
+        _node = obj._get_typetree_node()
+        for _child in _node.m_Children:
+            _pos_before = _tmp_reader.Position
+            _rv(_child, _tmp_reader, _tmp_config)
+            field_offsets[_child.m_Name] = _pos_before
+    except Exception:
+        pass
+
+    if "image data" in field_offsets:
+        image_data_size_pos = field_offsets["image data"]
+
+    part1 = bytearray(original_raw[:image_data_size_pos])
+
+    # 정확한 오프셋으로 필드 패치
+    if "m_Width" in field_offsets and field_offsets["m_Width"] + 4 <= len(part1):
+        _struct.pack_into("<i", part1, field_offsets["m_Width"], width)
+    if "m_Height" in field_offsets and field_offsets["m_Height"] + 4 <= len(part1):
+        _struct.pack_into("<i", part1, field_offsets["m_Height"], height)
+    if "m_CompleteImageSize" in field_offsets and field_offsets["m_CompleteImageSize"] + 4 <= len(part1):
+        _struct.pack_into("<I", part1, field_offsets["m_CompleteImageSize"], len(image_data))
+
+    part1 = bytes(part1)
+
+    # Part 2+3 — inline image data + 빈 StreamingInfo
+    from UnityPy.streams import EndianBinaryWriter
+    w = EndianBinaryWriter(endian="<")
+    w.write_int(len(image_data))
+    w.write(image_data)
+    pos = w.Length
+    pad = (4 - pos % 4) % 4
+    if pad:
+        w.write(b"\x00" * pad)
+    w.write_u_long(0)   # offset
+    w.write_u_int(0)    # size
+    w.write_int(0)      # empty path (length=0)
+    pos = w.Length
+    pad = (4 - pos % 4) % 4
+    if pad:
+        w.write(b"\x00" * pad)
+    part2_3 = w.bytes
+    w.dispose()
+
+    # Part 4 — trailing bytes
+    if "image data" in field_offsets and _tmp_reader is not None:
+        typetree_end = _tmp_reader.Position
+        part4 = original_raw[typetree_end:]
+    else:
+        part4 = original_raw[orig_stream_end:]
+
+    new_raw = part1 + part2_3 + part4
+    obj.set_raw_data(new_raw)
+    obj.assets_file.mark_changed()
+    return True
 
 
 def save_serialized_file_with_fallback(serialized_file: Any) -> bytes:
@@ -554,6 +910,42 @@ def save_serialized_file_with_fallback(serialized_file: Any) -> bytes:
             errors.append(e)
     joined = "; ".join(str(e) for e in errors)
     raise RuntimeError(f"에셋 저장 실패: {joined}")
+
+
+def _save_texture_with_unitycn_fallback(
+    texture: Any,
+    tex_obj_reader: Any | None,
+    texture_image: Image.Image,
+) -> None:
+    """Texture2D를 저장합니다. UnityCN(trailing bytes/size mismatch)이 감지되면
+    binary patch를 시도하고, 아니면 일반 save()를 사용합니다.
+    """
+    texture.set_image(texture_image)
+
+    need_binary_patch = False
+    if tex_obj_reader is not None:
+        if _has_trailing_bytes(tex_obj_reader) or _detect_typetree_size_mismatch(tex_obj_reader):
+            need_binary_patch = True
+
+    if need_binary_patch and tex_obj_reader is not None:
+        # binary patch에 필요한 image_data를 texture에서 가져옵니다
+        tex_w, tex_h = texture_image.size
+        # texture.set_image() 후 내부 image_data가 갱신되므로 get_raw_data에서 추출
+        # save()를 통해 image_data를 얻는 대신, 직접 인코딩합니다
+        try:
+            from UnityPy.export.Texture2DConverter import image_to_texture2d
+            img_data = image_to_texture2d(texture_image, texture.m_TextureFormat)
+            if _binary_patch_texture2d(
+                tex_obj_reader,
+                image_data=img_data,
+                width=tex_w,
+                height=tex_h,
+            ):
+                return
+        except Exception:
+            pass
+    # 일반 저장 경로
+    texture.save()
 
 
 def image_equal(a: Image.Image, b: Image.Image) -> bool:
@@ -1370,7 +1762,7 @@ def apply_sprite_mode_and_rect(
     mode: Mode,
     tight_rect: tuple[int, int, int, int] | None = None,
 ) -> tuple[int, int]:
-    tree = sprite_obj.read_typetree()
+    tree = read_typetree_tolerant(sprite_obj)
     rd = cast(dict[str, Any], tree.get("m_RD", {}))
     before = int(rd.get("settingsRaw", 0))
     after = before
@@ -1413,7 +1805,7 @@ def apply_tightmesh_mode_and_mesh(
     tight_rect: tuple[int, int, int, int],
     alpha: Image.Image,
 ) -> tuple[int, int, bool]:
-    tree = sprite_obj.read_typetree()
+    tree = read_typetree_tolerant(sprite_obj)
     rd = cast(dict[str, Any], tree.get("m_RD", {}))
 
     before = int(rd.get("settingsRaw", 0))
@@ -1508,7 +1900,7 @@ def update_atlas_settings(sprite: Any, mode: Mode) -> None:
         return
 
     try:
-        atlas = atlas_ptr.read()
+        atlas = deref_parse_as_object_tolerant(atlas_ptr)
         render_map = getattr(atlas, "m_RenderDataMap", None)
         render_key = getattr(sprite, "m_RenderDataKey", None)
         if render_map is None or render_key is None or render_key not in render_map:
@@ -1608,7 +2000,7 @@ def replace_sprites_in_assets_file(
         print(f"[스킵] UnityPy.load 실패: {assets_file.name} ({e})")
         return 0, 0, 0
     file_lower = assets_file.name.lower()
-    texture_cache: dict[int, Any] = {}
+    texture_cache: dict[int, tuple[Any, Any]] = {}  # path_id -> (texture_parsed, tex_obj_reader)
 
     replaced = 0
     skipped_missing = 0
@@ -1618,7 +2010,7 @@ def replace_sprites_in_assets_file(
     for obj in env.objects:
         if obj.type.name != "Sprite":
             continue
-        sprite = obj.read()
+        sprite = read_object_tolerant(obj)
         path_id = int(obj.path_id)
         sprite_name = str(getattr(sprite, "m_Name", "") or "")
         assets_name = obj.assets_file.name
@@ -1673,12 +2065,15 @@ def replace_sprites_in_assets_file(
             print(f"[스킵] 유효하지 않은 texture PathID: {assets_file.name}:{path_id}:{sprite_name}")
             continue
 
-        texture = texture_cache.get(texture_path_id)
+        cached = texture_cache.get(texture_path_id)
+        texture = cached[0] if cached else None
+        tex_obj_reader = cached[1] if cached else None
         if texture is None:
             for tex_obj in env.objects:
                 if tex_obj.type.name == "Texture2D" and int(tex_obj.path_id) == texture_path_id:
-                    texture = tex_obj.read()
-                    texture_cache[texture_path_id] = texture
+                    texture = read_object_tolerant(tex_obj)
+                    tex_obj_reader = tex_obj
+                    texture_cache[texture_path_id] = (texture, tex_obj)
                     break
         if texture is None:
             print(f"[스킵] Texture2D를 찾을 수 없습니다: {assets_file.name}:{path_id}:{sprite_name}")
@@ -1688,6 +2083,9 @@ def replace_sprites_in_assets_file(
             texture_image = texture.image.convert("RGBA")
         except FileNotFoundError as e:
             print(f"[스킵] 리소스 파일 누락으로 Texture2D를 읽을 수 없습니다: {assets_file.name}:{path_id}:{sprite_name} ({e})")
+            continue
+        except Exception as e:
+            print(f"[스킵] Texture2D 이미지 읽기 실패: {assets_file.name}:{path_id}:{sprite_name} ({e})")
             continue
         texture_rect = getattr(getattr(sprite, "m_RD", None), "textureRect", None)
         x = int(round(getattr(texture_rect, "x", 0.0)))
@@ -1707,7 +2105,7 @@ def replace_sprites_in_assets_file(
             base_x, base_y, base_w, base_h = x, y, w, h
         base_y_top = texture_image.height - (base_y + base_h)
 
-        tree_now = obj.read_typetree()
+        tree_now = read_typetree_tolerant(obj)
         rd_now = cast(dict[str, Any], tree_now.get("m_RD", {}))
         raw_now = int(rd_now.get("settingsRaw", 0))
         rect_now = cast(dict[str, Any], rd_now.get("textureRect", {}))
@@ -1772,8 +2170,7 @@ def replace_sprites_in_assets_file(
 
             # alpha 마스크 없이 덮어써야 sprite 결과가 원본 PNG와 일치합니다.
             texture_image.paste(target_img, (write_x, write_y_top))
-            texture.set_image(texture_image)
-            texture.save()
+            _save_texture_with_unitycn_fallback(texture, tex_obj_reader, texture_image)
             before, after = apply_sprite_mode_and_rect(obj, mode="fullrect", tight_rect=(fullrect_x, fullrect_y, fullrect_w, fullrect_h))
             update_atlas_settings(sprite, mode="fullrect")
         elif target_mode == "tightmesh":
@@ -1811,8 +2208,7 @@ def replace_sprites_in_assets_file(
 
             texture_image.paste((0, 0, 0, 0), (base_x, base_y_top, base_x + base_w, base_y_top + base_h))
             texture_image.paste(fitted, (write_x, write_y_top))
-            texture.set_image(texture_image)
-            texture.save()
+            _save_texture_with_unitycn_fallback(texture, tex_obj_reader, texture_image)
 
             before, after, mesh_ok = apply_tightmesh_mode_and_mesh(
                 obj,
@@ -1848,8 +2244,7 @@ def replace_sprites_in_assets_file(
             # 원 영역을 투명하게 지우고, bbox만 다시 기록
             texture_image.paste((0, 0, 0, 0), (base_x, base_y_top, base_x + base_w, base_y_top + base_h))
             texture_image.paste(clipped, (new_x, new_y_top))
-            texture.set_image(texture_image)
-            texture.save()
+            _save_texture_with_unitycn_fallback(texture, tex_obj_reader, texture_image)
 
             before, after = apply_sprite_mode_and_rect(
                 obj,
